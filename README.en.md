@@ -1,48 +1,341 @@
 # prompt-lab
 
-Start here: the theory behind every yardstick opens [README.md](README.md) (in Japanese).
-It explains the idea every yardstick in this harness rests on: from the probabilities a decision
-model returns, measure how many more bits about the outcome a prompt lets you recover.
+*This is the English translation of [README.md](README.md) (in Japanese), which is the source.*
 
-prompt-lab measures, for any task with a known outcome, how much a prompt lets a **decision model**
-tell about that outcome, **without fooling yourself**. You give it timestamped cases with an outcome
-(two classes or more, and optionally a value such as +2 for a win and −50 for a loss). Searchers
-(people or AI agents) write prompts: which fields of a case the model reads, and which typed questions
-it answers about them. The harness measures each prompt on a training period, lets each searcher look
-at an evaluation period only a limited, logged number of times, selects by a rule written down in
-advance, and runs the selected prompt on a test period exactly once.
+prompt-lab is a harness that measures, without overfitting, how many more bits about an outcome a decision model can read thanks to a prompt.
+This README first explains the idea behind its yardsticks. How to use it starts at "Quick start (no key needed)".
+It is written for engineers who know entropy, cross-entropy and mutual information. It skips the definitions and keeps to what is estimated and where the bound breaks down.
 
-The first use, and the case study behind the tool, is *veto rules*: "skip this case if any of these
-apply". The same yardsticks measure a multi-class outcome or a prompt with several questions.
+A decision model (such as `typesafe-ai/jev` on the Vercel AI Gateway) takes a state and typed questions and returns its answers as probabilities.
+For a boolean question it returns the probability of "yes", for a choice a probability per option, and for a score a probability per level.
+Because the answers are probabilities, how good a prompt is can be measured in a unit that does not depend on the task: the bits it recovers about the outcome.
 
-It was built for [Jev](https://vercel.com/docs/ai-gateway/modalities/decision) (`typesafe-ai/jev` on
-the Vercel AI Gateway), a decision model that takes a state and typed questions and returns
-probabilities. A rule or a question whose answer can be written as a Python-like expression is also
-answered by the free `machine` decider, so most of the search costs nothing.
+## 1. Setting and notation
 
-Requirements: Python 3.10+, numpy. No other dependency.
+- `X`: the contents of one row (a case)
+- `T`: what the decision model is given to read: `X` itself, or a text made from `X`
+- `Z`: the outcome, known later. For an FX alert, "did the trade lose"; for a summary, "the correct answer to a question about the original article"
+- `q(z|T)`: the probability the decision model returned, or that probability recalibrated
+- `CE`: the mean negative log-likelihood of the true outcomes over the rows measured (bits)
+- gain: `H(Z) − CE`. The harness reports it as a percentage of `H(Z)` (`cv_gain_pct`)
 
-[日本語の README](README.md) · [The protocol and its reasons](docs/protocol.md)
+The size of `H(Z)` varies a lot between tasks.
+On the evaluation split of the FX case study, 54 of 1,270 cases were losses, and `H(Z)` was 0.254 bits. The rarer the outcome, the less room a prompt has to reduce it.
 
-## Why
+## 2. A lower bound on mutual information
 
-Searching prompts by trial and error on labelled data overfits quickly, and the overfitting is hard
-to see. In the case study behind this tool (FX alerts), every one of these happened:
+When `q` is a function of `T` alone, the expected cross-entropy splits as follows.
 
-- **Losses cluster in time.** Cross-validation that splits row by row leaks a losing episode into both
-  sides; splitting by month made a tree model's AUC drop from 0.63 to 0.57.
-- **"Positive" is not zero.** Random answers have a cross-validated gain around −0.7% of H(Z) on a
-  1,270-row evaluation set; a result is only evidence when it sits high in that random distribution.
-- **Looking is fitting.** Every check on the evaluation set is a chance to pick what happened to work there.
-- **AUC is not money.** With +2 wins and −50 losses you break even at a 96.2% win rate; a better AUC
-  can still lose. The cross-validated gain is even sign-blind: a rule whose effect *reversed* can score
-  high on it.
-- **Regimes change.** Trend and volatility rules that worked in both halves of the training period
-  vanished on the evaluation period; only narrow structural rules (fixed time windows) survived.
+```math
+\mathbb{E}\left[-\log_2 q(Z \mid T)\right] = H(Z \mid T) + \mathbb{E}_T\left[ D_{\mathrm{KL}}\big(p(\cdot \mid T) \,\|\, q(\cdot \mid T)\big) \right]
+```
 
-The harness turns these into mechanics: time splits, month-grouped CV, a measured zero point, a cap on
-evaluation looks with a log, a frozen pre-registration, rule-based selection and a one-shot test.
-[docs/protocol.md](docs/protocol.md) explains each one.
+Subtracting both sides from `H(Z)` gives:
+
+```math
+H(Z) - \mathbb{E}[CE] = I(Z;T) - \mathbb{E}_T\left[ D_{\mathrm{KL}}\big(p(\cdot \mid T) \,\|\, q(\cdot \mid T)\big) \right] \le I(Z;T)
+```
+
+The gain is a lower bound on `I(Z;T)`, and its gap to the bound is exactly the expected KL divergence between the decision model's probabilities and the true conditional distribution.
+This inequality is known as the variational lower bound (Barber and Agakov, 2003).
+
+Two things follow.
+
+- If the gain measured on new rows is positive, `T` carries at least that much information.
+- A small gain does not mean that `T` carries no information. The KL term, the part the decision model failed to read, may simply be large.
+
+Strictly, what is measured is not Shannon's mutual information itself but the information usable within the family V of predictors allowed: the V-information (Xu et al., 2020).
+
+```math
+I_V(T \to Z) = H_V(Z \mid \varnothing) - H_V(Z \mid T)
+```
+
+`H_V` is the cross-entropy of the best predictor in V.
+When V contains the predictors that ignore their input (constants), `H_V(Z|∅)` equals `H(Z)`, and `I_V(T→Z)` is at least 0 and at most `I(Z;T)`.
+When V contains every predictor, it equals Shannon's mutual information.
+
+For `H(Z)` the harness uses the value computed from the outcome shares on the rows measured (the plug-in estimate).
+In expectation this estimate is at most the true `H(Z)`, so it errs toward underestimating the gain.
+
+## 3. Two ways to measure
+
+### The as-is gain
+
+The probabilities the decision model returned are used as `q` directly.
+This amounts to taking V as the single predictor that is the decision model. It contains no constant predictor, so this is not V-information, and it can be negative even in the population.
+Besides the information the model failed to read, the KL gap to the bound includes the bias in how it assigns probabilities (poor calibration).
+Confident misses weigh heavily. Of 4 statements that are true half the time (`H(Z)` is 1 bit), answer 3 correctly at 0.99 and miss 1 at 0.99: the accuracy is 75%, but the gain is −0.672 bits.
+
+### The recalibrated gain
+
+The decision model's answer `s` (such as the probability of skipping) is recalibrated by a logistic regression of the form `σ(a + b·logit s)` before it is used as `q`.
+This is the harness's `cv_gain_pct`.
+
+It estimates the V-information with the predictive family V taken as `{σ(a + b·logit s)}`.
+With `b = 0`, V contains the constant predictors, so the population value is at least 0. A negative measured value comes from fitting on finitely many rows, and the zero point of section 4 deals with it.
+The quantity estimated is at most `I(Z;s)`, and by the data processing inequality `I(Z;s) ≤ I(Z;T)`.
+Recalibration removes uniform shifts and stretches on the logit scale (always saying too high, being overconfident, and so on).
+
+The regression is fitted by cross-validation, and `CE` is measured on the folds not used to fit it. There are 10 folds, repeated 3 times, and by default the rows of one month go into the same fold.
+In a task whose outcomes cluster in time, splitting the folds row by row puts rows of the same episode on both sides, and the gain comes out too high.
+
+The recalibrated gain does not care about the sign of the slope `b`, so it is blind to the direction of an answer. A rule whose effect reversed still scores a high gain.
+Whether using it gains or loses is checked separately, with the decision table (value per 1,000 cases; item 6 of [The protocol and its reasons](docs/protocol.md)).
+
+### The gain in the training direction
+
+On the evaluation and test splits, the harness also reports a gain (`transfer_gain_pct`) that builds each row's score `η` from the coefficients of V fitted on the training split, and on the split measured refits only the intercept `a` and the strength `c` of `σ(a + c·η)` (`c ≥ 0`).
+For an answer whose direction reversed, `c` stops at 0, so the gain falls to the zero point. If the effect only weakened, `c` shrinks and the gain stays positive.
+Even in a task without a value field, a selection rule that requires this quantity makes it harder to select an answer whose direction changed after the training split ([ADR-0011](docs/adr/0011-transfer-gain-keeps-the-training-direction.md)).
+
+The difference between the two gains is what you lose by trusting the decision model's probabilities without recalibrating them.
+Whether a decision model that claims good calibration really has it can be checked by this difference.
+
+As a check that fits no model, the answers are split into 5 bins of equal weight and the plug-in mutual information with the outcome is reported (`mi_pct`).
+A binned plug-in estimate is biased upward, so the value reported subtracts the mean of 500 measurements on shuffled outcomes.
+
+## 4. Estimation bias and the zero point
+
+The bound holds for the expected `CE` measured on rows not used to make `q`. Measuring on finitely many rows brings in two biases.
+
+- The recalibrating regression is fitted on finitely many rows, so even for an answer without information the expected cross-validated gain is negative.
+- Measuring on rows used to choose the prompt or the regression adds the optimism of having chosen, and the result is no longer a lower bound.
+
+For the first, random answers, 200 continuous and 200 0/1, are measured with the same yardstick on the same rows, labels, weights and folds. A result is read as its percentile in that distribution.
+On the evaluation split of the FX case study (1,270 cases), the median gain of random answers was −0.72%, and the 95th percentile was about 0.
+So a result of −0.1% does not show that there is no information. It sits high among random answers.
+
+For the second, the harness uses training, evaluation and test splits divided by time, a cap and a log on looks at the evaluation split, a pre-registration, and a single test run ([The protocol and its reasons](docs/protocol.md)).
+
+## 5. Tasks that produce text
+
+The same yardsticks work for tasks where an LLM writes text, such as summarization. A decision model is placed after the writing LLM and reads only the text written.
+
+```
+row X → writing LLM (the prompt being tuned) → text T → decision model (fixed questions) → probabilities → gain
+```
+
+With `s` the decision model's answer, the data processing inequality orders the quantities of the stages as follows.
+
+```math
+H(Z) - CE \le I(Z;s) \le I(Z;T) \le I(Z;X)
+```
+
+Improving the writer's prompt amounts to increasing what the decision model can read from `T`.
+In Shannon's terms, no way of writing can exceed `I(Z;X)`.
+The decision model and the questions are fixed and written in the pre-registration. If the reading side moved too, its effect could not be told apart from how good the writing side is.
+
+### A summarization example
+
+`Z` is whether a statement about an article is true. Half the statements are true, and half are false statements with exactly one fact changed (`H(Z)` is 1 bit).
+The decision model is given different things to read, and the probabilities it puts on "true" are compared. The table is an example with 4 statements for one article.
+
+| what it reads | the 2 true statements | the 2 false statements | CE (bits) | gain (bits) |
+|---|---|---|---|---|
+| nothing | 0.5, 0.5 | 0.5, 0.5 | 1.000 | 0.000 |
+| the summary | 0.8, 0.6 | 0.2, 0.4 | 0.529 | 0.471 |
+| the full article | 0.95, 0.9 | 0.05, 0.1 | 0.113 | 0.887 |
+
+Taking reading nothing and reading the full article as the two ends, 53% of what this decision model can read from the full article survives in the summary (`(1.000 − 0.529) ÷ (1.000 − 0.113)`).
+This share is a quantity fixed by the decision model and the set of questions.
+
+The share can, however, exceed 100%.
+The ordering of the inequalities above holds for Shannon's quantities, and V-information can grow under further processing (Xu et al., 2020).
+If the writing LLM rewrites the information in a form the decision model reads more easily, the summary can yield more than the full article.
+That can happen, for example, when the full article exceeds the decision model's context length (32,000 tokens for Jev). Read the full-article value not as an upper bound but as a reference mark on the scale.
+
+### Writing the questions, and the screens
+
+An LLM writes the questions for each article, and the decision model screens them twice.
+
+- Questions it misses when reading the full article are dropped. This removes questions whose correct answer was set wrong.
+- Questions it gets right when reading nothing are dropped. This removes questions answerable from the question text and what the decision model remembers.
+
+Strictly, the decision model also reads the question text `Q`, so what is measured is a lower bound on `I(Z; T, Q)`.
+The gain when reading nothing stands for `I(Z;Q)`. With the second screen keeping it near 0, the rest can be read as what `T` carried.
+
+These two screens also give the two ends of the table above.
+The question-writing LLM is not shown the summaries, and how the questions are written goes in the pre-registration.
+The questions are split into training and evaluation sets too, and cross-validation keeps the questions of one article in the same fold, because questions about the same article are not independent.
+
+## 6. Tasks it fits
+
+| task | what is tuned | `Z` |
+|---|---|---|
+| judging, classifying, skipping (FX veto rules, for example) | the prompt given to the decision model | the correct label |
+| summarizing, extracting, reporting | the writing LLM's prompt | answers to questions about the source document |
+| comparing decision models | the decision model (Jev, Gemini Decision, Liquid d1, and so on) | the correct answers for the same rows and questions |
+
+When comparing decision models, compare the usable information by the recalibrated gain, and the calibration by its difference from the as-is gain.
+Choosing which model to use is itself a kind of fitting, so the comparison is made on the training rows, and it also counts toward the looks at the evaluation rows.
+
+## 7. Information that holds across time
+
+In this section `t` is time and `F` a factor. They are different symbols from the `T` of sections 1–6 (what the decision model reads).
+A factor is something that gives one number per row: the value of a state field, whether a text field takes a given value, or a rule or question of a prompt as the machine (`expr`) answers it.
+`plab survey` measures, factor by factor, whether its relation to the outcome holds across periods. It is used before starting a new study, to check whether the data hold information worth searching for.
+
+### 7.1 The question
+
+A relation found on the training split is used in the periods after it. If the relation moves from period to period, the information usable with one fixed relation is less than what knowing each period's relation would give.
+This section is about the size of that difference and what remains for a fixed relation.
+
+### 7.2 The split
+
+```math
+I(Z;F \mid t) = I(Z;F) + \big[\, I(Z;F \mid t) - I(Z;F) \,\big], \qquad I(Z;F \mid t) - I(Z;F) = I(Z;t \mid F) - I(Z;t)
+```
+
+The left side is the information usable when the relation at each time is known, and the first term is the information usable with one relation over all periods.
+The bracket holds the information that rides on the relation changing with time. When `F` and `Z` are independent given `t`, the bracket is `−I(Z;F)`, which is negative.
+A search that writes fixed rules reaches the first term at most. Using the bracket requires re-learning the relation while using it.
+`plab survey` measures this split in a form that follows each period's outcome share but fixes the slope (7.3).
+
+### 7.3 Forecasting with a stale coefficient
+
+With `p_t(z|F)` the true conditional distribution at time `t`, forecasting with a `q(z|F)` fitted at another time gives the following gain against that period's outcome share.
+
+```math
+\mathrm{gain}(q) = I_t - \mathbb{E}_F\, D_{\mathrm{KL}}\big(p_t(\cdot \mid F) \,\|\, q(\cdot \mid F)\big), \qquad I_t = I(Z;F \mid t)
+```
+
+Standardize `F` to mean 0 and standard deviation 1, and let `π` be the outcome share. For a logistic V with a small slope `b`, `p(F) − π ≈ π(1 − π) b F` and `KL ≈ (p − π)² / (2π(1 − π))` give the approximation:
+
+```math
+I_t \approx \kappa\, b_t^2, \qquad \kappa = \frac{\pi(1-\pi)}{2}\ \text{nats}
+```
+
+With the intercept refitted and the slope fixed at `b`, forecasting at time `t` leaves a KL term of about `κ(b − b_t)²`. The gain of the fixed slope is `κ(2 b b_t − b²)`.
+With `μ` the mean of the true per-period slopes and `σ²` their variance between periods, the gain averaged over periods is largest at `b = μ`, where it is `κμ²`. Knowing each period's slope would give `κ(μ² + σ²)`.
+
+```math
+\underbrace{\kappa(\mu^2+\sigma^2)}_{\text{each period's slope known}} = \underbrace{\kappa\mu^2}_{\text{usable with one slope}} + \underbrace{\kappa\sigma^2}_{\text{rides on the slope's changes}}
+```
+
+The tables write the share usable with one slope, `μ² / (μ² + σ²)`, as `share`.
+With several answer columns, read `b` as a vector measured in the covariance of the columns. With `θ` the angle between the learned coefficients and the current ones, `I_t cos²θ` remains and `I_t sin²θ` is lost.
+`transfer_gain_pct` (section 3) refits a strength `c ≥ 0`, so it stops at 0 when `cos θ < 0`. With one column, `θ` is 0 or π, so as long as the strength is refitted, a fixed factor loses only when its direction reverses.
+
+At an outcome share of 5%, `κb²` differs from the exact `I(Z;F)`, computed by Gauss-Hermite quadrature, by 0.7% at `b = 0.3` and by 2.1% at `b = 0.5`.
+
+### 7.4 The estimate per factor
+
+- A factor's values are turned into midranks (ties get the mean of their ranks) and then standardized to mean 0 and standard deviation 1. A row without a value sits at the mean rank. A heavy-tailed field and a 0/1 field compare on the same `κ`, and a monotone change of a field's unit leaves the numbers unchanged. The rows are in time order, so ranking ties by row position would put a time trend into the factor. Midranks prevent that.
+- A state field that is a number or a boolean becomes one factor. A text field becomes one 0/1 factor per value, only when it has at most 12 values, and only for values held by 2–98% of the rows. Given a prompt, the factors are each rule, each question that combines two or more rules, and each question with an `expr` (a choice gives one factor per option, a score its level index). Rules and questions without an `expr` are listed as not surveyed, with the reason.
+- In every period (`--by`, half a year by default), a one-factor logistic regression `logit P = a + b F` is fitted, giving the slope `b_t` and its standard error `s_t` from the Fisher information. It reads every row of the split at weight 1, not the down-sampled training sample: a factor's values cost nothing, so there is no reason to down-sample. A period with fewer than 5 rows of either class is left out.
+- The summary across periods is the DerSimonian-Laird random-effects estimate. `μ` is the mean weighted by `1/(s_t² + σ̂²)`, and its standard error is `SE(μ) = (Σ 1/(s_t² + σ̂²))^{-1/2}`.
+
+```math
+w_t = s_t^{-2},\qquad Q = \sum_t w_t\,(b_t - \bar b_w)^2,\qquad \hat\sigma^2 = \max\!\Big(0,\ \frac{Q - (k-1)}{\sum_t w_t - \sum_t w_t^2 / \sum_t w_t}\Big)
+```
+
+- `μ²` as it stands comes out larger by `SE(μ)²`, so the survey uses `μ₂ = max(0, μ² − SE(μ)²)`. This is the same treatment as subtracting the per-period sampling noise to get `σ̂²`. In the tables, `info%` is `100 κ μ₂ / H(Z)` (`H(Z)` in nats), `share` is `μ₂ / (μ₂ + σ̂²)`, and `nats/yr` is a year's number of rows times `κμ₂`.
+- `σ̂` is truncated at 0, so it is biased upward near 0. In the synthetic runs of 7.7, the mean of `σ̂` was 0.07 when the true `σ` was 0.
+- The expected value of `Q` is `(k − 1) + cσ²` (`c` is the denominator in the formula above). The `σ` at which `Q` reaches the threshold of 7.6 is reported as the floor. A `σ` below the floor cannot be told from 0 with that number of periods.
+- When the outcome takes three or more values, the same is done for each value other than the reference, on the rows of that value and the reference only. As in V, each value is compared against the reference, and a table is printed per value. With two values it is done once.
+
+### 7.5 What can be learned, and the gain of re-learning
+
+The expected KL of a maximum-likelihood fit is `d/(2N)` for `d` fitted numbers, so with `N` rows in a window, fitting one slope costs about `1/(2N)` nats per forecast row.
+The gain per row is about `I − 1/(2N)`, and the usable share is `1 − 1/(2NI)`. If the window gathers `N·I` = 1 nat of information, half remains; at 5 nats, 90%.
+
+When the slope moves as a random walk, what can be tracked is limited too. If the slope takes `τ` periods to move by its own size, with `n` rows a period and `I` nats of information per row, the share usable by tracking is about:
+
+```math
+1 - \frac{1}{\sqrt{2 n \tau I}}
+```
+
+One period's rows carry a Fisher information of `2κn` about the slope. With a step variance of `b²/τ`, the steady-state error variance `P` of a Kalman filter is `b/√(2κnτ)`, and each row loses `κP`. Dividing `κP` by `I = κb²` gives the second term of the formula above.
+
+`plab survey` measures the gain of re-learning (`pq` in the tables) directly. Following Dawid's (1984) prequential approach, each month is forecast by `a + bF` fitted on a window before that month.
+The forecast is compared with one that re-learns only the outcome share on the same window, in % of the `H(Z)` of the rows forecast. The windows are 6, 12 and 24 months, and all earlier months (`all`). `--gap` takes the number of months until an outcome is known, and the window ends that many months earlier.
+
+- Every window forecasts the same months. The months forecast are those with the longest fixed window plus `--gap` months before them, and with rows of both classes in every window's months. Forecasting different months per window would compare which window wins on different targets.
+- A fixed window is used only when it is at most half the months of the surveyed span. With a training split of two and a half years, the 24-month window is not used.
+- The standard error comes from the spread of the monthly gains. Outcomes cluster in time, so months, not rows, are the units. Cells beyond 2 standard errors get `*`.
+- The `all` window roughly measures a fixed relation, and the short windows a tracked one.
+- Where a factor without information lands is given per window by the formula below. `n_m` is the number of rows in month m, `N_m` the number of rows in that month's window, and `n` the number of rows forecast.
+
+```math
+-100\ \frac{\sum_m n_m / (2 N_m)}{n\, H(Z)}
+```
+
+In the synthetic runs of 7.7, the 24-month and all-month windows landed where this formula says, and the shorter the window, the slightly lower the measured position (0.02–0.09 points on the 6-month window). With only about 30 positives in a window, learning probably costs more than `1/(2N)`.
+
+### 7.6 Reading
+
+Each factor gets two tests and is read as one of four words. The mean counts when `|μ| ≥ 2 SE(μ)`. The spread counts when `Q`, turned into a standard normal (the Wilson-Hilferty approximation), is 2 or more.
+
+| | spread does not count | spread counts |
+|---|---|---|
+| mean counts | `stable` | `partly` |
+| mean does not count | `none` | `moving` |
+
+A factor with fewer than 4 usable periods is `few`.
+
+- The chance that a factor without information looks like something on either test is about 6.7% (from 4.6% two-sided and 2.3% one-sided). The summary prints the number of factors times this rate, as the count expected by chance. Nothing is corrected for multiple comparisons.
+- The `μ` of a rule found by searching the same rows comes out larger by the amount of choosing. Either measure only rules with a reason before looking at the rows, or discount them.
+- `stable` means that within the surveyed periods the slope did not move by more than the floor. It says nothing about later periods. Surveying the training split alone, a rule whose direction turns right after the training split also looks `stable`, as rule (b) of the synthetic example in 7.7 does.
+- For a strong factor, the weak-effect approximation breaks down. At an outcome share of 5%, `κb²` overstates the exact quantity by 13% at `|b| = 1`, and at a share of 40% by 32%. Read strong factors by the `pq` columns. On the synthetic three-class rows (`ticket_rows` in `tests/helpers.py`), a factor with `μ` of 2 had an `info%` of 70%, and its re-learning gain was 49%.
+
+The tables fall into three shapes. Information that remains reads `stable` or `partly` with a large `share`, and has `pq 24` and `pq all` above the no-information position. Information riding on change has `σ` at least `|μ|`, and its short windows do no worse than its long ones. Without information, about as many factors read as something as chance gives, and every window sits near the no-information position.
+Whether to start a search is decided by combining these numbers with things outside the data (how the rules were made, whether new rows will keep coming). `plab survey` does not decide.
+
+### 7.7 Numbers checked
+
+These are synthetic numbers: 95 rows a month, an outcome share of about 5% (intercept −3), and a true slope that is AR(1) over half-years. They were run 40 times with different seeds (built like `planted` in `tests/test_survey.py`).
+
+| planted slope | readings, 20 half-years | readings, 8 half-years | `μ` over 20 half-years (`SE`) | `σ̂` over 20 half-years (floor) |
+|---|---|---|---|---|
+| constant 0.3 | stable 40 | stable 39, none 1 | 0.286 (0.049) | 0.072 (0.174) |
+| mean 0.3, spread 0.3 | partly 37, stable 2, moving 1 | stable 15, partly 13, moving 11, none 1 | 0.308 (0.080) | 0.288 (0.175) |
+| spread 0.4 around 0 | moving 34, partly 6 | moving 25, none 9, partly 4, stable 2 | 0.014 (0.095) | 0.369 (0.175) |
+| no information | none 37, stable 2, moving 1 | none 40 | −0.002 (0.048) | 0.057 (0.173) |
+
+The mean gain of re-learning over 20 half-years (% of `H(Z)`):
+
+| planted slope | 6 months | 12 months | 24 months | all months |
+|---|---|---|---|---|
+| constant 0.3 | +0.47 | +0.73 | +0.87 | +0.93 |
+| spread 0.4 around 0 | +0.58 | +0.48 | +0.20 | −0.12 |
+| no information | −0.48 | −0.26 | −0.11 | −0.04 |
+| no-information position (formula) | −0.46 | −0.23 | −0.12 | −0.05 |
+
+- With 20 half-years, the readings come out as planted. A factor without information looked like something 3 times in 40, in line with the expected 6.7%.
+- With 8 half-years (a four-year training split), the floor of the spread is 0.23. A spread of 0.3 is only a little above it, so 15 of the 40 runs read `stable`. The floor tells you this in advance.
+- A constant slope gains most by re-learning on all months, and a moving slope gains more the shorter the window. For the factor without information, 0 of 160 cells got `*`, over 20 half-years and over 8.
+
+In the synthetic example of the quick start (seed 7), `walkthrough.py` also runs the survey. Rule (b) (skip when the 24-hour move is strong) changes direction in 2022.
+Surveying the training split (2018–2021) alone, both (a) and (b) read `stable`. (b) has `μ = +0.26` and a `pq 12` of +1.69% *.
+Surveying every split (2018–2025) after the test, (a) stays `stable` (`μ = +0.26`, `share` 0.89, `pq all` +0.93% *). (b) becomes `moving` (`μ = +0.10`, `σ̂ = 0.20`, `share` 0.11, `pq all` −0.12%).
+
+On the FX case study's rows (January 2022 to October 2026, 5,170 cases, 242 losses), a study surveyed every split after its test run, with these results.
+
+- Of the 47 factors made from the state fields, 3 read `stable`, 3 `moving` and 41 `none`. Chance alone makes 3.2 look like something.
+- Even the factor with the most information usable by one slope has 0.24% of `H(Z)`, which gathers only 0.5 nats a year. Even the 24-month window holds about 1 nat, and the cost of learning takes half of it.
+- No re-learning cell got `*` (the largest was +0.35%, with a standard error of 0.25). The floor of the spread is 0.23, and smaller movements are not visible.
+- Compared with the prototype's numbers on rows from September 2016, `μ` fell within 2 standard errors for 31 of the 32 number and boolean fields. The 1 outside and the 2 near it were fields for the level of volatility. Over 2016–2026 they had a negative slope, but on the rows from 2022 it is about 0.
+
+## 8. What is built and what is still a plan
+
+The yardsticks are in `src/yardsticks.py`. What is built:
+
+- The as-is gain (`asis_gain_pct`). It is reported when the prompt's `forecast` says which option of which question forecasts which outcome.
+- The gain in the training direction (`transfer_gain_pct`). It is reported on the evaluation and test splits.
+- The recalibrated gain (`cv_gain_pct`). It also handles outcomes with three or more values and rows with several questions. V is the family that gives the probability of each outcome value by softmax from features lining up the answers of every question (the log ratio of each option's probability to that of the reference option). With two outcome values and one question it gives the same number as the `σ(a + b·logit s)` of section 3.
+- Mutual information over 5 bins, minus its mean on shuffled outcomes (`mi_pct`). It is reported only for two outcome values and a prompt that writes a `forecast`.
+- The zero point measured with random answers, per answer shape (the kind of each question and its number of options). The random answers are of two kinds: ones that spread their probability (soft) and ones that put it on one option (sharp).
+- Calls to the decision model, through `/v1/decisions` of the Vercel AI Gateway (`src/gateway.py`).
+- The survey of how each factor's coefficient changes over time, from section 7 (`plab survey`, `src/survey.py`). It calls no decision model and reads only the state fields and the machine's answers.
+
+Two parts are still at the plan stage:
+
+- the writing-LLM stage (section 5)
+- the stage that writes questions and screens them
+
+[日本語の README](README.md) · [The protocol and its reasons](docs/protocol.md) · [Design decisions (ADR)](docs/adr/README.md)
+
+Requirements: Python 3.10+ and numpy. No other dependency.
 
 ## Quick start (no key needed)
 
@@ -57,13 +350,13 @@ The walkthrough makes 12,000 synthetic alerts (2018–2025, about 4.6% fail, a w
 every year; (b) a strong move toward the alert direction makes failure 2.4 times as likely before
 2022 and *less* likely after; (c) volatility grows 2.5 times in 2022. Splits: training 2018–2021,
 evaluation 2022–2023, test 2024–2025. It then runs every command below, with the `machine` decider and
-the `fake` decider. What you will see (seed 7):
+the `fake` decider (made-up answers for tests). What you will see (seed 7):
 
 | prompt (machine decider) | training: cv_gain (percentile among random answers), AUC halves | evaluation: AUC, value per 1,000 vs take-everything |
 |---|---|---|
-| (b) skip when `move_24h_toward > 12` | 0.69% (100th), 0.528 / 0.571, lift > 1 in every year | 0.464 (3rd percentile), **−78**; skips 12% → 29% because volatility grew |
-| (b) relative to volatility | | cv_gain 0.54% (100th) but AUC 0.460, **−140**: information with the wrong sign |
-| (a) skip 13:00–15:59 UTC | 0.52% (100th), 0.562 / 0.553 | 0.565, cv_gain 0.56% (100th), **+356** |
+| (b) skip when `move_24h_toward > 12` | 0.69% (100th), 0.528 / 0.571, lift > 1 in every year | 0.464 (3rd percentile), −78; skips 12% → 29% because volatility grew |
+| (b) relative to volatility | | cv_gain 0.54% (100th) but AUC 0.460, −140: information with the wrong sign |
+| (a) skip 13:00–15:59 UTC | 0.52% (100th), 0.562 / 0.553 | 0.565, cv_gain 0.56% (100th), +356 |
 | (a) or (b) | 1.12% (100th), the best in training | cv_gain −0.19% (74th), fails selection |
 
 The selection rule picks (a); the single test run gives 3.84% failures among the 2,242 alerts taken
@@ -95,7 +388,7 @@ that is wrong costs about 20 bits. The recalibrated `cv_gain` does not pay that 
    waiting as `Retry-After` says or 1, 2, 4 ... seconds. 401, 402 (no credit) and 403 stop the run, and so
    does a reply that answers other questions; what was paid for so far is stored.
 
-A typical full evaluation (1,000–1,300 calls of ~600 tokens) costs about $0.03–0.04.
+A full evaluation (1,000–1,300 calls of about 600 tokens each) costs about $0.03–0.04.
 
 To compare decision models on one prompt, add them to `deciders` and name several:
 `plab run P.json --agent A --decider jev --decider other`.
@@ -130,8 +423,8 @@ What is measured, nominated and selected is a candidate: a prompt and a decider.
 not open, which commands it may run, its caps, and how to report back. In Claude Code, the skill
 [plab-search](.claude/skills/plab-search/SKILL.md) (in Japanese) takes that brief and keeps writing,
 measuring and revising prompts until it nominates. Before any search, the skill
-[plab-survey](.claude/skills/plab-survey/SKILL.md) runs `plab survey` and decides whether a search is
-worth starting.
+[plab-survey](.claude/skills/plab-survey/SKILL.md) (in Japanese) runs `plab survey` and decides whether a
+search is worth starting.
 
 Commands take `-C DIR` (the task folder; default: the current folder). Refusals exit with code 2.
 
@@ -145,7 +438,7 @@ Commands take `-C DIR` (the task folder; default: the current folder). Refusals 
 | `run PROMPT [--decider NAME ...]` | train | logged to `runs.jsonl`; several `--decider` print the deciders side by side |
 | `agree PROMPT [--decider NAME] [--per-rule] [--limit N]` | train | every question the machine can answer (rules with an `expr` on each, or an `expr`): a yes/no answer at the decision threshold, a choice or score by the option it gives the most probability, against the machine, leaving out units either one refused; disagreeing ids |
 | `drift PROMPT [--decider NAME] [--by quarter\|half\|year]` | train | by period: with `decision` and a forecast, rule hits, positive rates and value; otherwise each question's answers by option and the outcome among them |
-| `survey [PROMPT] [--by quarter\|half\|year] [--gap MONTHS] [--splits train\|all]` | train (`all`: every split) | the state fields, or a prompt's rules and questions as the machine answers them, as factors: each one's slope by period, its mean and spread, and the gain of re-learning it (see the yardsticks). Writes nothing on the training split; `--splits all` runs only on a closed study, is marked EXPLORATORY and is logged to `surveys.jsonl` |
+| `survey [PROMPT] [--by quarter\|half\|year] [--gap MONTHS] [--splits train\|all]` | train (`all`: every split) | the state fields, or a prompt's rules and questions as the machine answers them, as factors: each one's slope by period, its mean and spread, and the gain of re-learning it (section 7). Writes nothing on the training split; `--splits all` runs only on a closed study, is marked EXPLORATORY and is logged to `surveys.jsonl` |
 | `null PROMPT [--split train\|eval] [--force]` | train, eval | the zero point for the prompt's answer shape (stored per split and shape); `eval` needs freeze |
 | `prereg freeze [--force]\|status` | – | hashes prereg.md, the locked settings of task.json and the split files |
 | `check PROMPT --agent A [--decider NAME]` | eval | freeze required; cap `budget.eval_checks_per_agent`; every check logged |
@@ -244,10 +537,10 @@ without `decision` must state its own.
   - `{"question": NAME, "classes": {option: class}}`: every option of one question forecasts a class.
     The decider's own probabilities are then a forecast, which gives the as-is gain and, with two
     classes, AUC, binned MI and the decision table.
-  - `"fitted"`: the forecast is V fitted on the training answers. On the training split it is out of fold, so its AUC is taken
-    within each fold and averaged, and binned MI, the quintiles and the cross-fit, which compare units of different folds, are
-    left out. Pooled over folds they read a weak answer wrong: its AUC fell below 0.5 and its MI rose.
-    There is no as-is gain.
+  - `"fitted"`: the forecast is V fitted on the training answers. There is no as-is gain. On the training
+    split it is out of fold, so its AUC is taken within each fold and averaged, and binned MI, the
+    quintiles and the cross-fit, which compare units of different folds, are left out. Pooled over folds,
+    a weak answer's AUC fell below 0.5 and its MI rose.
   - absent: the prompt is measured by cv_gain alone.
 
 A task with three classes might ask a choice and a predicate:
@@ -263,12 +556,12 @@ A task with three classes might ask a choice and a predicate:
 The two prompt forms of prompt-lab 0.1 still load for a two-class task: `veto_rules` (one rules
 predicate whose yes forecasts class 1), and `questions` as an object beside `score`.
 
-**`expr`** is a small, safe language (parsed with `ast`, never `eval`): field names, numbers, strings,
+`expr` is a small, safe language (parsed with `ast`, never `eval`): field names, numbers, strings,
 `True/False/None`, tuples/lists, comparisons (`== != < <= > >= in, not in`, chained), `and/or/not`,
 `+ - * /`, `abs/min/max/len`, and subscripts/slices. An `expr` may only read fields that the prompt gives
-to the decider. **If a field it reads is null (or a list element it uses is null), or the computation fails
+to the decider. If a field it reads is null (or a list element it uses is null), or the computation fails
 (type mismatch, division by zero), the expr has no value: a rule does not apply, a predicate says no, and a
-choice or score counts as refused.**
+choice or score counts as refused.
 
 The prompt id is a hash of the fields, the questions as asked, their exprs and the forecast, not of the
 name. The answer store is keyed by what the decider reads: a gateway model reads the request only, so
@@ -289,9 +582,9 @@ editing an expr or the forecast reuses its answers.
 ## The yardsticks
 
 Z is the outcome with K ≥ 2 classes; class 0 is the reference. Each unit has a weight w (1 everywhere
-except in a down-sampled training split). The theory at the top of [README.md](README.md) gives the reasons.
+except in a down-sampled training split). Sections 1–4 of this README give the reasons.
 
-**The answers, encoded.** An answer is a probability over a question's options. A predicate gives
+The answers, encoded. An answer is a probability over a question's options. A predicate gives
 logit(P(yes)), a choice gives log(p_j / p_0) for each option after the first, and a score gives one
 column, logit(mean level / (levels − 1)). Probabilities are clipped to [1e-4, 1 − 1e-4] first. A choice
 answered without probabilities is a point mass on the chosen option. A refused question counts as the
@@ -299,110 +592,47 @@ uniform answer: its unit stays in, and the record counts it in `refused`.
 
 Information, for any K and any number of questions:
 
-- **cv_gain_pct**, the recalibrated gain: V is a multinomial logistic regression (softmax, class 0 as
+- `cv_gain_pct`, the recalibrated gain: V is a multinomial logistic regression (softmax, class 0 as
   reference) on the encoded answers of every question, fitted out of fold (10 folds grouped by
-  `cv_groups`, 3 repeats, seeds 100 + r, a 1e-3 ridge on the slopes). The result is
+  `cv_groups`, 3 repeats, seeds 100 + r, a 1e-3 ridge on the slopes only). The result is
   100 · (H(Z) − cross-entropy) / H(Z). It estimates the V-information of the answers about the outcome.
   With one predicate and two classes it is exactly the number 0.1.0 gave. **Sign-blind.**
-- **transfer_gain_pct**, the gain in the training direction (evaluation and test): V is fitted on all
-  training answers, and its slopes give each case a score E per class. On the split measured, E stays
-  fixed and only the intercepts and one strength c ≥ 0 are fitted, out of fold with the folds of
-  cv_gain. An answer whose relation to the outcome turned around falls to the zero point; one whose
-  relation only weakened keeps a positive gain. It fits one number more than the constant forecast,
-  whatever the number of columns. Measuring evaluation or test also reads the training answers (asking
-  the decider for those not stored); the record counts those without an answer (`trained_on`). **Sign-aware.** See
-  [ADR-0011](docs/adr/0011-transfer-gain-keeps-the-training-direction.md).
-- **asis_gain_pct**, the as-is gain: the same share for the decider's own probabilities, through the
+- `transfer_gain_pct`, the gain in the training direction (evaluation and test splits): V is fitted on
+  all training answers, and its coefficients without the intercepts give each case a score E per class.
+  On the split measured, E stays fixed and only the intercepts and one strength c ≥ 0 are fitted, out of
+  fold with the folds of cv_gain. An answer whose direction reversed falls to the zero point; one whose
+  effect only weakened keeps a positive gain. Whatever the number of answer columns, it fits only one
+  number more than the constant forecast. Measuring evaluation or test also uses the training answers
+  (asking the decider for those not stored, and counting the rows left without an answer in the record's
+  `trained_on`). Sign-aware.
+- `asis_gain_pct`, the as-is gain: the same share for the decider's own probabilities, through the
   prompt's `forecast`. Nothing is fitted, so it can be below zero on any number of units;
-  cv_gain − asis_gain is what trusting the raw probabilities costs. **Sign-aware.**
+  cv_gain − asis_gain is what trusting the raw probabilities without recalibrating them costs. Sign-aware.
 
 Use, for two classes and a forecast (s is the forecast probability of class 1):
 
-- **AUC** (weighted, ties count half), and on each training half. **Sign-aware.**
-- **mi_pct**, binned MI: s in 5 bins of equal weight, the mutual information with Z minus the mean of 500
+- AUC (weighted, ties count half), and the AUC on each training half. Sign-aware.
+- `mi_pct`, binned MI: s in 5 bins of equal weight, the mutual information with Z minus the mean of 500
   shuffles, in % of H(Z), with its permutation p. It fits no model. **Sign-blind.**
-- **Positive rate by forecast quintile.**
-- **Decision** (with `decision` and values): skip when s ≥ the threshold. The skip share, the positive and
+- The positive rate by forecast quintile.
+- Decision (with `decision` and values): skip when s ≥ the threshold. The skip share, the positive and
   negative rates among the cases taken, the positive rate among those skipped and the lift, the value per
-  1,000 cases, and the same for taking everything. **Sign-aware.**
-- **Cross-fit** (training, with values and `half_boundary`): the best skip share (5% steps) chosen on one
-  half and applied to the other, both ways. **Sign-aware.**
-- **Test**: cases taken, positive and negative rates with Wilson 95% intervals, value per case and in
+  1,000 cases, and the same for taking everything. Sign-aware.
+- Cross-fit (training, with values and `half_boundary`): the best skip share (5% steps) chosen on one
+  half and applied to the other, both ways. Sign-aware.
+- Test: cases taken, positive and negative rates with Wilson 95% intervals, value per case and in
   total, AUC with a one-sided permutation p, and binned MI; next to taking everything.
 
-**Zero point.** The same yardsticks on random answers of the prompt's shape (the kind and number of
-options of every question and, with two classes, which options forecast class 1), keeping the split's labels, weights and
-groups. There are two kinds, 200 of each: *soft* answers spread their probability at random, and
-*sharp* answers put all of it on one option. A result is placed among the sharp kind when at least 90%
-of its weight has at most 0.15 of its probability off one option on every question, and among the soft
-kind otherwise. Every record prints its percentile. On evaluation and test, the direction of
+Information that holds across time (`plab survey`). Section 7 defines the columns `mu`, `sigma`,
+`share`, `info%`, `nats/yr` and `pq` of its tables, and says how to read them.
+
+Zero point. The same yardsticks on random answers of the prompt's shape (the kind and number of
+options of every question and, with two classes, which options forecast class 1), keeping the split's
+labels, weights and groups. There are two kinds, 200 of each: *soft* answers spread their probability at
+random, and *sharp* answers put all of it on one option. A result is placed among the sharp kind when at
+least 90% of its weight has at most 0.15 of its probability off one option on every question, and among
+the soft kind otherwise. Every record prints its percentile. On evaluation and test, the direction of
 `transfer_gain_pct` comes from V fitted on other random answers.
-
-### Information that holds across time (`plab survey`)
-
-Section 7 of [README.md](README.md) is the source; this is its English counterpart. Here t is
-time and F a factor: one number per case, such as a state field, whether a text field takes a value,
-or a rule or question of a prompt as the machine (`expr`) answers it. (The T of the theory above is
-what the decider reads, a different thing.)
-
-**The split.** I(Z;F|t) = I(Z;F) + [I(Z;F|t) − I(Z;F)], and the bracket equals I(Z;t|F) − I(Z;t). The
-first term is what one relation over all periods can use; the bracket rides on how the relation
-changes with time (it is −I(Z;F) when F and Z are independent given t). A search that writes fixed
-rules reaches the first term only.
-
-**A stale slope.** A forecast q fitted at another time scores gain(q) = I_t − E KL(p_t ‖ q), I_t =
-I(Z;F|t), against the period's own base rate. With F standardized, a class share π and a weak effect,
-I_t ≈ κ b_t² with κ = π(1 − π)/2 nats. A slope fixed at b (intercept refitted) loses about κ(b − b_t)²,
-so it keeps κ(2 b b_t − b²). With μ and σ² the mean and the between-period variance of the true slope,
-the best fixed slope is b = μ and keeps κμ² on average, of the κ(μ² + σ²) a slope known in every period
-would use: the stable share μ²/(μ² + σ²). With several columns, the angle θ between the learned and the
-current coefficients keeps I_t cos²θ; `transfer_gain_pct` refits a strength c ≥ 0, so for one factor
-only a reversed sign costs. At π = 5%, κb² is within 0.7% of the exact I(Z;F) (Gauss-Hermite) at
-b = 0.3 and within 2.1% at b = 0.5; it overstates by 13% at b = 1 (32% at π = 40%), so read strong
-factors by the re-learning columns.
-
-**The estimate.** The factor's midranks (ties share their mean rank; a case without a value sits at the
-mean rank), standardized: rows are in time order, so ranking ties by position would plant a time trend.
-A text field gives one 0/1 factor per value held by 2% to 98% of the cases, when it has at most 12
-values; lists and rules without an `expr` are listed as not surveyed. In every period (`--by`, half a
-year by default) a one-factor logistic slope b_t and its Fisher standard error s_t, on every row of the
-split at weight 1 (the factors are free, so nothing is down-sampled); a period needs 5 cases of each
-class. DerSimonian-Laird across the periods: Q, σ̂² = max(0, (Q − (k − 1)) / (Σw − Σw²/Σw)) with
-w = 1/s², μ weighted by 1/(s² + σ̂²) and its SE. μ² is biased up by SE(μ)², so the survey uses
-μ₂ = max(0, μ² − SE(μ)²): info% = 100 κ μ₂ / H(Z) (in nats), share = μ₂/(μ₂ + σ̂²), nats/yr = a year of
-cases times κμ₂. σ̂ is biased up near 0; the floor of σ is where Q is expected to reach the spread test,
-and a smaller σ cannot be told from none with these periods. With K > 2 classes, each class is surveyed
-against the reference class on the cases of the two.
-
-**What can be learned.** Fitting one slope on N cases costs about 1/(2N) nats per forecast case, so a
-window keeps 1 − 1/(2NI) of I: half when it gathers N·I = 1 nat, 90% at 5 nats. A random-walk slope
-that drifts its own size in τ periods, with n cases a period, can be tracked to about 1 − 1/√(2nτI).
-The survey measures re-learning directly (`pq`, prequential as in Dawid 1984): every month is forecast
-by a + bF fitted on the 6, 12 or 24 months before it, or on all of them, against the base rate
-re-learned on the same window, in % of H(Z) of the forecast cases. `--gap` is the months before an
-outcome is known. Every window forecasts the same months (those with the longest fixed window plus the
-gap before them, both classes in every window), so the columns compare; a fixed window is kept only
-when it is at most half the span. The standard error comes from the spread of the monthly gains (losses
-cluster in time) and `*` marks a cell above 2 of them. A factor without information is expected at
-−100 Σ n_m/(2N_m) / (n H(Z)); in the planted checks the 24-month and all-month windows land there and
-the short windows a little below (0.02 to 0.09 points on 6 months).
-
-**Reading.** The mean counts when |μ| ≥ 2 SE(μ); the spread counts when Q as a standard normal
-(Wilson-Hilferty) is at least 2. Mean and no spread: `stable`; both: `partly`; spread only: `moving`;
-neither: `none`; fewer than 4 periods: `few`. A factor without information reads as something about
-6.7% of the time, and the summary prints that count next to the readings; nothing is corrected for
-multiplicity, and a rule found by searching the same rows has an inflated μ. `stable` says the slope did
-not move by more than the floor inside the surveyed periods, and nothing about later ones. The survey
-gives no verdict on a study; the [plab-survey](.claude/skills/plab-survey/SKILL.md) skill decides.
-
-**Checked.** Planted slopes, 95 cases a month at a 5% rate, 40 seeds over 20 half-years: a slope fixed
-at 0.3 reads `stable` 40 times; mean 0.3 with spread 0.3, `partly` 37; spread 0.4 around 0, `moving`
-34; no information, `none` 37 and no starred cell of 160. Over 8 half-years (a four-year training
-split) the floor of σ is 0.23, so a spread of 0.3 reads `stable` 15 times out of 40. In the synthetic
-walkthrough, rule (b), which flips in 2022, reads `stable` on the training split and `moving` on every
-split after the test (σ̂ 0.20, share 0.11). On the FX case study's rows (2022-01 to 2026-10, 5,170
-cases, 242 losses), 6 of 47 factors read as something against 3.2 by chance, the largest fixed-slope
-information is 0.24% of H(Z), or 0.5 nats a year, and no re-learning cell is starred.
 
 ## What the harness enforces, and what it cannot
 
@@ -421,3 +651,9 @@ files like a sealed envelope.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## References
+
+- D. Barber and F. Agakov. The IM Algorithm: A Variational Approach to Information Maximization. NIPS 2003.
+- Y. Xu, S. Zhao, J. Song, R. Stewart, and S. Ermon. A Theory of Usable Information under Computational Constraints. ICLR 2020.
+- T. M. Cover and J. A. Thomas. Elements of Information Theory, 2nd ed. Wiley, 2006.
