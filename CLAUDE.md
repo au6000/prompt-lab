@@ -18,7 +18,7 @@
 | `docs/` | `protocol.md`: 事例研究から得た 7 つの教訓と、ハーネスがそれぞれに何をするか。`adr/`: 後戻りしにくい設計の決定の記録 (1 件 1 ファイル、`adr/README.md` が一覧と書き方)。決定を変えるときは新しい ADR を足し、古い方を置き換え済みにする |
 | `.claude/skills/` | リポジトリと一緒に配る Claude Code のスキル。`plab-search/SKILL.md` は、Opus が探す人としてプロンプトを書いて測り、直し続けて推すまでの手順 (ADR-0010)。`plab-survey/SKILL.md` は、研究を始める前に `plab survey` を流し、探索を始めるかを決める手順 (ADR-0013。数の定義は README.ja.md の 7 章にだけ書く)。読んでよい物・使ってよいコマンド・上限は `plab brief` の指示にだけ書き、スキルには写さない |
 | `.audit/` | git に入れない手元の記録。`baseline/` は 0.1.0 で取った parity の基準 (書き換えない)、`after/` は書き直した版で取った数、`backup-v0.1/` は 0.1.0 の写し |
-| `llm_kit/` | LLM を呼ぶ道具箱 (LangChain の上。プロバイダの切り替え・構造化出力と送り直し・料金の集計、`config.py` に料金表と既定のモデル)。GitHub の au6000/llm_kit の clone そのもの (中に `.git` があり、直したらここで commit して push する)。自分の `pyproject.toml` を持ち、prompt-lab の pyproject には入れない。`tests/` はその検査で、依存が無い環境では丸ごと飛ばす。`import llm_kit` だけでは LangChain を読まない (`__init__.py`)。promptlab からはまだ呼んでいない。使い方は `llm_kit/README.md` |
+| `llm_kit/` | LLM を呼ぶ道具箱 (LangChain の上。プロバイダの切り替え・構造化出力と送り直し・料金の集計、`config.py` に料金表と既定のモデル)。GitHub の au6000/llm_kit の clone そのもの (中に `.git` があり、直したらここで commit して push する)。prompt-lab はこれを submodule として記録し、使う llm_kit のコミットだけを持つ。llm_kit で commit したら、prompt-lab でも `llm_kit` が指すコミットを commit し直す。`--recurse-submodules` を付けずに clone すると中は空になるが、本体の検査はそのままで通る。自分の `pyproject.toml` を持ち、prompt-lab の pyproject には入れない。`tests/` はその検査で、依存が無い環境では丸ごと飛ばす。`import llm_kit` だけでは LangChain を読まない (`__init__.py`)。promptlab からはまだ呼んでいない。使い方は `llm_kit/README.md` |
 
 課題のフォルダ (task.json・rows.jsonl・prereg.md・prompts/) はハーネスの外に置く。ハーネスはその中の `.plab/` にだけ書く。
 
