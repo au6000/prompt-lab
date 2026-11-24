@@ -1,4 +1,4 @@
-"""The survey: does a task's data carry information that holds across time? (README.ja.md, section 7)
+"""The survey: does a task's data carry information that holds across time? (README.md, section 7)
 
 A factor is one column of numbers over the units: a state field, a level of a text field, a rule of
 a prompt, an option of a question the machine can answer. For each factor the survey fits
@@ -154,7 +154,7 @@ class Versus:
 
 def kappa(pi: float) -> float:
     """Nats per unit per b^2 of a standardized factor with a weak effect: I(Z;F) ~ kappa b^2, pi the
-    share of the class (README.ja.md 7.3)."""
+    share of the class (README.md 7.3)."""
     return pi * (1 - pi) / 2
 
 

@@ -1,12 +1,12 @@
 ---
 name: plab-survey
-description: prompt-lab の課題のフォルダで、新しい研究を始める前に、データに時間をまたいで残る情報があるかを `plab survey` で確かめ、探索を始めるかを決める。「survey して」「このデータで探す値打ちがあるか」「係数が時間で動くか見て」と頼まれたときに使う。数の定義と読み方は README.ja.md の 7 章にあり、このスキルは流す順と決め方だけを決める。
+description: prompt-lab の課題のフォルダで、新しい研究を始める前に、データに時間をまたいで残る情報があるかを `plab survey` で確かめ、探索を始めるかを決める。「survey して」「このデータで探す値打ちがあるか」「係数が時間で動くか見て」と頼まれたときに使う。数の定義と読み方は README.md の 7 章にあり、このスキルは流す順と決め方だけを決める。
 ---
 
 # plab-survey
 
 `plab survey` を流し、因子ごとの読み (`stable`・`partly`・`moving`・`none`・`few`) と学び直した利得から、探索を始めるかを決めて報告する。
-数の定義と読み方は README.ja.md の 7 章にあり、ここには写さない。開いてはいけない物は、`plab brief` の指示の「What you must not open」と同じ。
+数の定義と読み方は README.md の 7 章にあり、ここには写さない。開いてはいけない物は、`plab brief` の指示の「What you must not open」と同じ。
 
 ## 始める前に決める物
 

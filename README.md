@@ -1,256 +1,500 @@
 # prompt-lab
 
-Start here: the theory behind every yardstick opens [README.ja.md](README.ja.md) (in Japanese).
-It explains the idea every yardstick in this harness rests on: from the probabilities a decision
-model returns, measure how many more bits about the outcome a prompt lets you recover.
+prompt-lab はプロンプトによって、判定モデルが結果について何ビット多く読み取れるようになったかを、過学習せずに測るハーネスです。
+ここでは、その物差しの考え方を説明します。使い方は「鍵なしの手早い始め方」から下にあります。
+読み手として、エントロピー・交差エントロピー・相互情報量を知っているエンジニアを想定しています。定義の説明は省き、何を推定しているかと、どこで下限が崩れるかに絞ります。
 
-prompt-lab measures, for any task with a known outcome, how much a prompt lets a **decision model**
-tell about that outcome, **without fooling yourself**. You give it timestamped cases with an outcome
-(two classes or more, and optionally a value such as +2 for a win and −50 for a loss). Searchers
-(people or AI agents) write prompts: which fields of a case the model reads, and which typed questions
-it answers about them. The harness measures each prompt on a training period, lets each searcher look
-at an evaluation period only a limited, logged number of times, selects by a rule written down in
-advance, and runs the selected prompt on a test period exactly once.
+判定モデル（Vercel AI Gateway の `typesafe-ai/jev` など）は、状態と型つきの問いを受け取り、答えを確率で返します。
+boolean の問いには「はい」の確率を、choice には選択肢ごとの確率を、score には段階ごとの確率を返します。
+答えが確率なので、プロンプトの良し悪しを、結果について読み取れたビット数という課題によらない単位で測れます。
 
-The first use, and the case study behind the tool, is *veto rules*: "skip this case if any of these
-apply". The same yardsticks measure a multi-class outcome or a prompt with several questions.
+## 1. 設定と記号
 
-It was built for [Jev](https://vercel.com/docs/ai-gateway/modalities/decision) (`typesafe-ai/jev` on
-the Vercel AI Gateway), a decision model that takes a state and typed questions and returns
-probabilities. A rule or a question whose answer can be written as a Python-like expression is also
-answered by the free `machine` decider, so most of the search costs nothing.
+- `X`: 1 行（事例）の中身
+- `T`: 判定モデルに読ませる物。`X` そのものか、`X` から作った文章
+- `Z`: あとから分かる結果。FX の通知なら「その取引が負けたか」、要約なら「元の記事についての問いの正しい答え」
+- `q(z|T)`: 判定モデルが返した確率、またはそれを当て直した確率
+- `CE`: 評価する行での、本当の結果の負の対数尤度の平均（ビット）
+- 利得: `H(Z) − CE`。このハーネスは `H(Z)` に対する百分率で出します（`cv_gain_pct`）
 
-Requirements: Python 3.10+, numpy. No other dependency.
+`H(Z)` の大きさは課題によって大きく違います。
+FX の事例研究の評価の組では、1,270 件のうち負けが 54 件で、`H(Z)` は 0.254 ビットでした。結果がまれなほど、プロンプトで減らせる余地も小さくなります。
 
-[日本語の README](README.ja.md) · [The protocol and its reasons](docs/protocol.md)
+## 2. 相互情報量の下限
 
-## Why
+`q` が `T` だけの関数なら、交差エントロピーの期待値は次のように分かれます。
 
-Searching prompts by trial and error on labelled data overfits quickly, and the overfitting is hard
-to see. In the case study behind this tool (FX alerts), every one of these happened:
+```math
+\mathbb{E}\left[-\log_2 q(Z \mid T)\right] = H(Z \mid T) + \mathbb{E}_T\left[ D_{\mathrm{KL}}\big(p(\cdot \mid T) \,\|\, q(\cdot \mid T)\big) \right]
+```
 
-- **Losses cluster in time.** Cross-validation that splits row by row leaks a losing episode into both
-  sides; splitting by month made a tree model's AUC drop from 0.63 to 0.57.
-- **"Positive" is not zero.** Random answers have a cross-validated gain around −0.7% of H(Z) on a
-  1,270-row evaluation set; a result is only evidence when it sits high in that random distribution.
-- **Looking is fitting.** Every check on the evaluation set is a chance to pick what happened to work there.
-- **AUC is not money.** With +2 wins and −50 losses you break even at a 96.2% win rate; a better AUC
-  can still lose. The cross-validated gain is even sign-blind: a rule whose effect *reversed* can score
-  high on it.
-- **Regimes change.** Trend and volatility rules that worked in both halves of the training period
-  vanished on the evaluation period; only narrow structural rules (fixed time windows) survived.
+両辺を `H(Z)` から引くと、次の式になります。
 
-The harness turns these into mechanics: time splits, month-grouped CV, a measured zero point, a cap on
-evaluation looks with a log, a frozen pre-registration, rule-based selection and a one-shot test.
-[docs/protocol.md](docs/protocol.md) explains each one.
+```math
+H(Z) - \mathbb{E}[CE] = I(Z;T) - \mathbb{E}_T\left[ D_{\mathrm{KL}}\big(p(\cdot \mid T) \,\|\, q(\cdot \mid T)\big) \right] \le I(Z;T)
+```
 
-## Quick start (no key needed)
+利得は `I(Z;T)` の下限で、下限との差はちょうど、判定モデルの確率と本当の条件付き分布との KL の期待値です。
+この不等式は変分下限として知られています（Barber と Agakov、2003 年）。
+
+ここから次の 2 つが言えます。
+
+- 新しい行で測った利得が正なら、`T` には少なくともその分の情報があります。
+- 利得が小さくても、`T` に情報が無いとは言えません。KL の項、つまり判定モデルが読み取れなかった分が大きいだけかもしれません。
+
+正確に言えば、測っているのはシャノンの相互情報量そのものではなく、予測器がとれる範囲 V の中で使える情報、V-information です（Xu ほか、2020 年）。
+
+```math
+I_V(T \to Z) = H_V(Z \mid \varnothing) - H_V(Z \mid T)
+```
+
+`H_V` は、V の中で最善の予測器の交差エントロピーです。
+V が入力を無視する予測器（定数）を含むとき、`H_V(Z|∅)` は `H(Z)` に一致し、`I_V(T→Z)` は 0 以上で `I(Z;T)` 以下になります。
+V がすべての予測器を含めば、シャノンの相互情報量に一致します。
+
+`H(Z)` には評価する行での結果の割合から計算した値（plug-in の推定値）を使います。
+この推定値は期待値では本当の `H(Z)` 以下なので、利得を低めに見積もる向きに働きます。
+
+## 3. 2 つの測り方
+
+### そのままの利得
+
+判定モデルが返した確率をそのまま `q` に使います。
+V を判定モデルの予測器 1 つだけに取ったものにあたり、定数の予測器を含まないので、V-information ではありません。そのため母集団でも負になりえます。
+下限との差の KL には情報を読み取れなかった分に加えて、確率の付け方の偏り（較正の悪さ）も入ります。
+自信過剰な外れは大きく効きます。正誤が半々（`H(Z)` が 1 ビット）の 4 問のうち、3 問に 0.99 で正しく答え、1 問に 0.99 で外すと、正答率は 75% でも利得は −0.672 ビットです。
+
+### 当て直した利得
+
+判定モデルの答え `s`（見送りの確率など）を、`σ(a + b·logit s)` の形のロジスティック回帰で当て直してから `q` に使います。
+このハーネスの `cv_gain_pct` がこれにあたります。
+
+予測の族 V を `{σ(a + b·logit s)}` に取った V-information の推定です。
+V は `b = 0` で定数の予測器を含むので、母集団の値は 0 以上です。測った値が負になるのは有限の行で当てはめたためで、4 章の 0 の位置で扱います。
+推定している量は `I(Z;s)` 以下で、データ処理不等式から `I(Z;s) ≤ I(Z;T)` です。
+当て直すと、logit の上での一様なずれや伸び縮み（いつも高めに言う、自信を持ちすぎる、など）は取り除かれます。
+
+回帰は交差検証で当てはめ、当てはめに使っていない組で `CE` を測ります。組は 10 個で 3 回繰り返し、既定では同じ月の行を同じ組に入れます。
+結果が時刻に固まる課題で行ごとに組を分けると、同じ局面の行が両側に入り、利得が高く出るためです。
+
+傾き `b` の符号を問わないので、当て直した利得は答えの向きを見ません。効き目が逆になった事由でも利得は高く出ます。
+使ったときに得か損かは、別に判断の表（1,000 件あたりの値）で確かめます（[手順とその理由](docs/protocol.md) の 6）。
+
+### 向きを保った利得
+
+評価と本番の組では、学習の組で当てはめた V の係数で行ごとの得点 `η` を作り、測る組では `σ(a + c·η)`（`c ≥ 0`）の切片 `a` と倍率 `c` だけを当て直した利得も出します（`transfer_gain_pct`）。
+向きが逆になった答えでは `c` が 0 で止まるので、利得は 0 の位置まで落ちます。効き目が弱まっただけなら `c` が縮むので、利得は正のまま残ります。
+値の欄が無い課題でも、選び方でこの量を求めれば、学習の組のあとで向きが変わった答えを選びにくくなります（[ADR-0011](docs/adr/0011-transfer-gain-keeps-the-training-direction.md)）。
+
+2 つの利得の差は判定モデルの確率を当て直さずに信じたときに失う量です。
+「較正が良い」とうたう判定モデルが本当にそうかは、この差で確かめられます。
+
+モデルを当てはめない確かめとして、答えを重みつきで 5 つの区間に分け、結果との相互情報量を plug-in で出しています（`mi_pct`）。
+区間に分けた plug-in の推定値は正に偏るので、結果を並べ替えて 500 回測った平均を引いた値を出します。
+
+## 4. 推定の偏りと 0 の位置
+
+下限が成り立つのは、`q` を作るのに使っていない行で測った `CE` の期待値についてです。有限の行で測ると、2 つの偏りが入ります。
+
+- 当て直しの回帰を有限の行で当てはめるので、情報の無い答えでも、交差検証の利得の期待値は負になります。
+- プロンプトや回帰を選ぶのに使った行で測ると、選んだことによる楽観が入り、下限ではなくなります。
+
+1 つ目に対しては同じ行・ラベル・重み・組分けで、でたらめな答えを連続値と 0/1 で 200 通りずつ同じ物差しで測ります。結果はその分布の中のパーセンタイルで読みます。
+FX の事例研究の評価の組（1,270 件）では、でたらめな答えの利得の中央値が −0.72%、95 パーセンタイルがおよそ 0 でした。
+そのため −0.1% という結果は情報が無いことを示すのではなく、でたらめな答えの中では上のほうにあります。
+
+2 つ目に対しては時刻で分けた学習・評価・本番の組、評価の組を見る回数の上限と記録、事前登録、本番を 1 回だけ流すことで対処します（[手順とその理由](docs/protocol.md)）。
+
+## 5. 文章を作る課題
+
+要約のように LLM が文章を書く課題でも、同じ物差しが使えます。書く LLM のあとに判定モデルを置き、判定モデルには書かれた文章だけを読ませます。
+
+```
+行 X → 書く LLM（調整するプロンプト） → 文章 T → 判定モデル（固定した問い） → 確率 → 利得
+```
+
+判定モデルの答えを `s` とすると、データ処理不等式から、各段の量は次の順に並びます。
+
+```math
+H(Z) - CE \le I(Z;s) \le I(Z;T) \le I(Z;X)
+```
+
+書く側のプロンプトを直すことは、判定モデルが `T` から読み取れる分を増やすことにあたります。
+シャノンの量では、どう書いても `I(Z;X)` を超えません。
+判定モデルと問いは固定し、事前登録に書いておきます。読む側まで動かすと、書く側の良し悪しと区別できなくなるためです。
+
+### 要約の例
+
+`Z` は記事についての文が正しいかで、正しい文と、事実を 1 か所だけ変えた誤りの文を半々に用意します（`H(Z)` は 1 ビット）。
+判定モデルに読ませる物を変えて、「正しい」に付いた確率を比べます。次の表は記事 1 本に 4 つの文を用意したときの例です。
+
+| 読ませる物 | 正しい文 2 つ | 誤りの文 2 つ | CE（ビット） | 利得（ビット） |
+|---|---|---|---|---|
+| 何も読ませない | 0.5、0.5 | 0.5、0.5 | 1.000 | 0.000 |
+| 要約 | 0.8、0.6 | 0.2、0.4 | 0.529 | 0.471 |
+| 記事の全文 | 0.95、0.9 | 0.05、0.1 | 0.113 | 0.887 |
+
+何も読ませない場合と全文を読ませた場合を両端にすると、この判定モデルが全文から読み取れる分のうち 53% が要約に残っています（`(1.000 − 0.529) ÷ (1.000 − 0.113)`）。
+この割合は判定モデルと問いの集合によって決まる量です。
+
+ただし、この割合は 100% を超えることがあります。
+上の不等式の並びはシャノンの量についての物で、V-information は処理を重ねても増えないとは限らないからです（Xu ほか、2020 年）。
+書く LLM が情報を判定モデルの読みやすい形に書き直せば、要約から読み取れる量が全文から読み取れる量を上回ることがあります。
+全文が判定モデルの文脈の長さ（Jev は 32,000 トークン）を超える場合などです。全文の側の値は上限ではなく、目盛りの目安として読みます。
+
+### 問いの作り方とふるい
+
+問いの文は記事ごとに LLM に作らせ、判定モデルで 2 回ふるいにかけます。
+
+- 全文を読ませて外した問いを捨てます。正解の付け方が誤っている問いを除くためです。
+- 何も読ませずに当てた問いを捨てます。問いの文と判定モデルが覚えている知識だけで答えられる問いを除くためです。
+
+厳密には、判定モデルは問いの文 `Q` も読むので、測っているのは `I(Z; T, Q)` の下限です。
+何も読ませないときの利得は `I(Z;Q)` の側にあたります。2 つ目のふるいでこれを 0 近くにしておくと、残りを `T` が運んだ分として読めます。
+
+この 2 回のふるいは上の表の両端にもなります。
+問いを作る LLM には要約を見せず、問いの作り方は事前登録に書きます。
+問いも学習用と評価用に分け、交差検証では同じ記事の問いを同じ組に入れます。同じ記事の問いどうしは独立ではないためです。
+
+## 6. 使える課題
+
+| 課題 | 調整する物 | `Z` |
+|---|---|---|
+| 判定・分類・見送り（FX の阻却事由など） | 判定モデルに渡すプロンプト | 正解のラベル |
+| 要約・抽出・報告 | 書く LLM のプロンプト | 元の文書についての問いの答え |
+| 判定モデルどうしの比較 | 判定モデル（Jev、Gemini Decision、Liquid d1 など） | 同じ行と同じ問いの正解 |
+
+判定モデルどうしを比べるときは、使える情報の量を当て直した利得で比べ、較正をそのままの利得との差で比べます。
+どのモデルを使うかを選ぶのも当てはめの一種なので、比べるのは学習用の行で行い、評価用の行を見る回数にも数えます。
+
+## 7. 時間をまたいで残る情報
+
+この章では時刻を `t`、因子を `F` と書きます。1〜6 章の `T`（判定モデルに読ませる物）とは別の記号です。
+因子は行ごとに数が 1 つ決まる物で、状態の欄の値、文字の欄がある値をとるかどうか、プロンプトの事由や問いに機械（`expr`）が答えた物がこれにあたります。
+`plab survey` は因子ごとに、結果との関係が期間をまたいで保たれるかを測ります。新しい研究を始める前に、探す値打ちのある情報がデータにあるかを確かめるために使います。
+
+### 7.1 問い
+
+学習の組で見つけた関係は、そのあとの期間で使います。期間ごとに関係が動くなら、関係を 1 つに固定して使える情報は、期間ごとの関係を知っているときより少なくなります。
+この章では、その差の大きさと固定した関係に残る量を扱います。
+
+### 7.2 分け方
+
+```math
+I(Z;F \mid t) = I(Z;F) + \big[\, I(Z;F \mid t) - I(Z;F) \,\big], \qquad I(Z;F \mid t) - I(Z;F) = I(Z;t \mid F) - I(Z;t)
+```
+
+左辺はその時点の関係を知っていれば使える情報で、第 1 項はすべての期間を通じて 1 つの関係で使える情報です。
+かっこの中には、関係が時刻とともに変わることに乗った情報が入ります。`t` を決めると `F` と `Z` が独立になる場合は、かっこの中は `−I(Z;F)` で、負になります。
+固定した事由を書いて探す限り、届くのは第 1 項までです。かっこの中を使うには、使いながら関係を学び直す必要があります。
+`plab survey` は、期間ごとの結果の割合は追いかけ、傾きだけを固定したときの形でこの分け方を測ります（7.3）。
+
+### 7.3 古い係数で予想したとき
+
+時刻 `t` の本当の条件付き分布を `p_t(z|F)` とし、別の時刻に当てはめた予測 `q(z|F)` で予想すると、その期間の結果の割合を基準にした利得は次のとおりです。
+
+```math
+\mathrm{gain}(q) = I_t - \mathbb{E}_F\, D_{\mathrm{KL}}\big(p_t(\cdot \mid F) \,\|\, q(\cdot \mid F)\big), \qquad I_t = I(Z;F \mid t)
+```
+
+`F` を平均 0・標準偏差 1 にそろえ、結果の割合を `π` とします。ロジスティックの V で傾き `b` が小さいときは、`p(F) − π ≈ π(1 − π) b F` と `KL ≈ (p − π)² / (2π(1 − π))` から次の近似が成り立ちます。
+
+```math
+I_t \approx \kappa\, b_t^2, \qquad \kappa = \frac{\pi(1-\pi)}{2}\ \text{ナット}
+```
+
+切片を当て直し、傾きを `b` に固定して時刻 `t` で予想すると、KL の項はおよそ `κ(b − b_t)²` です。固定した傾きの利得は `κ(2 b b_t − b²)` になります。
+期間ごとの本当の傾きの平均を `μ`、期間のあいだの分散を `σ²` とすると、期間を通じた利得の平均は `b = μ` で最大の `κμ²` です。期間ごとの傾きを知っていれば `κ(μ² + σ²)` です。
+
+```math
+\underbrace{\kappa(\mu^2+\sigma^2)}_{\text{期間ごとの傾きを知っているとき}} = \underbrace{\kappa\mu^2}_{\text{1 つの傾きで使える}} + \underbrace{\kappa\sigma^2}_{\text{傾きの変化に乗っている}}
+```
+
+1 つの傾きで使える割合 `μ² / (μ² + σ²)` を、表では `share` と書きます。
+答えの列が複数あるときは、`b` を列の共分散で測るベクトルと読みます。学習した係数と今の係数の角度を `θ` とすると、残る分は `I_t cos²θ`、失う分は `I_t sin²θ` です。
+`transfer_gain_pct`（3 章）は倍率 `c ≥ 0` を当て直すので、`cos θ < 0` では 0 で止まります。列が 1 つなら `θ` は 0 か π で、倍率を当て直す限り、固定した因子が失うのは向きが逆になったときだけです。
+
+結果の割合が 5% のとき、`κb²` と、ガウス・エルミート求積で出した正確な `I(Z;F)` との差は、`b = 0.3` で 0.7%、`b = 0.5` で 2.1% です。
+
+### 7.4 因子ごとの推定
+
+- 因子の値は中央順位（同じ値には順位の平均を与える）に直してから、平均 0・標準偏差 1 にそろえます。値の無い行は平均の順位に置きます。裾の重い欄と 0/1 の欄が同じ `κ` で比べられ、欄の単位を単調に変えても数は変わりません。行は時刻の順に並んでいるので、同じ値の順位を行の位置で決めると、因子に時刻の傾向が入ります。中央順位はそれを防ぎます。
+- 状態の欄は数と真偽値なら 1 つの因子に、文字なら値が 12 種類以下のときだけ値ごとの 0/1 の因子にします（行の 2〜98% が当たる値だけ）。プロンプトを渡すと、事由ごと、2 つ以上の事由をまとめた問い、`expr` のある問い（choice は選択肢ごと、score は段階の番号）が因子になります。`expr` の無い事由と問いは、調べなかった物として理由と一緒に出します。
+- 期間（`--by`、既定は半年）ごとに、因子 1 つのロジスティック回帰 `logit P = a + b F` を当てはめ、傾き `b_t` と、フィッシャー情報量から出す標準誤差 `s_t` を出します。間引いた学習の標本ではなく、組のすべての行を重み 1 で読みます。因子の値はただで決まるので、間引く理由がありません。どちらかの値の行が 5 件に満たない期間は外します。
+- 期間をまたいだ要約は DerSimonian と Laird の変量効果の推定です。`μ` は重み `1/(s_t² + σ̂²)` の平均で、その標準誤差は `SE(μ) = (Σ 1/(s_t² + σ̂²))^{-1/2}` です。
+
+```math
+w_t = s_t^{-2},\qquad Q = \sum_t w_t\,(b_t - \bar b_w)^2,\qquad \hat\sigma^2 = \max\!\Big(0,\ \frac{Q - (k-1)}{\sum_t w_t - \sum_t w_t^2 / \sum_t w_t}\Big)
+```
+
+- `μ²` はそのままでは `SE(μ)²` だけ大きく出るので、`μ₂ = max(0, μ² − SE(μ)²)` を使います。`σ̂²` から期間ごとの標本の揺れを引くのと同じ扱いです。表の `info%` は `100 κ μ₂ / H(Z)`（`H(Z)` はナット）、`share` は `μ₂ / (μ₂ + σ̂²)`、`nats/yr` は 1 年分の行の数に `κμ₂` を掛けた数です。
+- `σ̂` は 0 で打ち切るので、0 の近くで上に偏ります。7.7 の合成の数では、本当の `σ` が 0 のとき `σ̂` の平均は 0.07 でした。
+- `Q` の期待値は `(k − 1) + cσ²` です（`c` は上の式の分母）。`Q` が 7.6 の判定の境に届く `σ` を下限として出します。下限より小さい `σ` は、その期間の数では 0 と区別できません。
+- 結果が 3 つ以上の値を取るときは、基準の値以外の値ごとに、その値と基準の値の行だけで同じことをします。V と同じく基準の値に対して比べ、値ごとの表を出します。2 値なら 1 回です。
+
+### 7.5 学べる量と、学び直したときの利得
+
+最尤推定の KL の期待値は当てはめる数 `d` について `d/(2N)` なので、窓に `N` 件の行があるとき、傾きを 1 つ当てはめる費用は予想する 1 件あたりおよそ `1/(2N)` ナットです。
+1 件あたりの利得はおよそ `I − 1/(2N)` で、使える割合は `1 − 1/(2NI)` になります。窓に集まる情報 `N·I` が 1 ナットなら半分、5 ナットなら 9 割が残ります。
+
+傾きがランダムウォークで動く場合は、追いかけられる量にも限りがあります。傾きが自分の大きさだけ動くのに `τ` 期間かかり、1 期間に `n` 件、1 件あたり `I` ナットの情報があるとき、追いかけて使える割合はおよそ次のとおりです。
+
+```math
+1 - \frac{1}{\sqrt{2 n \tau I}}
+```
+
+1 期間の行が傾きについて持つフィッシャー情報量は `2κn` です。歩幅の分散を `b²/τ` とすると、カルマンフィルタの定常の誤差の分散 `P` は `b/√(2κnτ)` になり、1 件あたり `κP` を失います。`κP` を `I = κb²` で割ると上の式の第 2 項です。
+
+`plab survey` は、学び直したときの利得（表の `pq`）を直接測ります。Dawid（1984 年）の prequential の考え方で、各月を、その月より前の窓で当てはめた `a + bF` で予想します。
+同じ窓で結果の割合だけを学び直した予想と比べ、予想した行の `H(Z)` に対する % で出します。窓は 6・12・24 か月と、それより前のすべての月（`all`）です。`--gap` には結果が分かるまでの月数を渡し、窓はその月数だけ前で終わります。
+
+- どの窓も同じ月を予想します。予想するのは、いちばん長い固定の窓と `--gap` を足した月数が前にあり、どの窓の月にも両方の値の行がある月です。窓ごとに違う月を予想すると、どの窓が得かを違う的で比べることになるためです。
+- 固定の窓は調べる期間の月数の半分以下の物だけを使います。学習の組が 2 年半なら、24 か月の窓は使いません。
+- 標準誤差は月ごとの利得のばらつきから出します。結果は時刻に固まるので、行ではなく月をまとまりとして扱います。2 標準誤差を超えた欄に `*` を付けます。
+- `all` の窓はおおよそ固定した関係を、短い窓は関係を追いかけた場合を測ります。
+- 情報の無い因子が来る位置は窓ごとに次の式で出します。`n_m` はその月の行の数、`N_m` はその月の窓の行の数、`n` は予想した行の数です。
+
+```math
+-100\ \frac{\sum_m n_m / (2 N_m)}{n\, H(Z)}
+```
+
+7.7 の合成の数では、24 か月とすべての月の窓ではこの位置どおりで、短い窓ほど測った位置が少し低く出ました（6 か月の窓で 0.02〜0.09 ポイント）。窓の中の正例が 30 件ほどしかないと、`1/(2N)` より学ぶ費用が大きくなるためと考えられます。
+
+### 7.6 読み方
+
+因子ごとに 2 つの検定を行い、4 つの語のどれかで読みます。平均は `|μ| ≥ 2 SE(μ)` のとき、ばらつきは `Q` を標準正規に直した値（Wilson と Hilferty の近似）が 2 以上のときに効いたと見ます。
+
+| | ばらつきが効かない | ばらつきが効く |
+|---|---|---|
+| 平均が効く | `stable` | `partly` |
+| 平均が効かない | `none` | `moving` |
+
+使える期間が 4 つに満たない因子は `few` です。
+
+- 情報の無い因子がどちらかの検定で何かに見える確率は、およそ 6.7% です（両側 4.6% と片側 2.3% から）。要約は、因子の数にこの率を掛けた数を、偶然でも出る数として並べます。多重比較の補正はしていません。
+- 同じ行を探して見つけた事由の `μ` は、選んだ分だけ大きく出ます。行を見る前に理由のある事由だけを測るか、割り引いて読みます。
+- `stable` は調べた期間の中で傾きが下限より大きく動かなかった、という意味です。そのあとの期間については何も言いません。学習の組だけを調べると、学習の組のすぐあとに向きが変わる事由も `stable` に見えます（7.7 の合成の例の (b)）。
+- 効き目が強い因子では、弱い効き目の近似が崩れます。結果の割合が 5% なら `|b| = 1` で `κb²` が正確な量を 13% 大きく見積もり、40% なら 32% 大きく見積もります。強い因子は `pq` の列で読みます。3 値の合成の行（`tests/helpers.py` の `ticket_rows`）では、`μ` が 2 の因子の `info%` が 70% で、学び直した利得は 49% でした。
+
+表の形は 3 つに分かれます。残る情報は `stable` か `partly` で `share` が大きく、`pq 24` と `pq all` が情報の無い位置より上にあります。変化に乗った情報は `σ` が `|μ|` 以上で、短い窓が長い窓より悪くありません。情報が無いときは、読みが偶然の数と同じくらいで、どの窓も情報の無い位置の近くにあります。
+探索を始めるかどうかは、これらの数とデータの外の事情（事由の作り方、これから新しい行が増えるか）を合わせて決めます。`plab survey` は決めません。
+
+### 7.7 確かめた数
+
+合成の数です。月に 95 件、結果の割合は約 5%（切片 −3）で、本当の傾きは半期ごとの AR(1) です。種を変えて 40 回流しました（`tests/test_survey.py` の `planted` と同じ作り方）。
+
+| 仕込んだ傾き | 20 半期の読み | 8 半期の読み | 20 半期の `μ`（`SE`） | 20 半期の `σ̂`（下限） |
+|---|---|---|---|---|
+| 0.3 で一定 | stable 40 | stable 39、none 1 | 0.286（0.049） | 0.072（0.174） |
+| 平均 0.3、ばらつき 0.3 | partly 37、stable 2、moving 1 | stable 15、partly 13、moving 11、none 1 | 0.308（0.080） | 0.288（0.175） |
+| 0 のまわりでばらつき 0.4 | moving 34、partly 6 | moving 25、none 9、partly 4、stable 2 | 0.014（0.095） | 0.369（0.175） |
+| 情報なし | none 37、stable 2、moving 1 | none 40 | −0.002（0.048） | 0.057（0.173） |
+
+20 半期で学び直した利得の平均（`H(Z)` に対する %）は次のとおりです。
+
+| 仕込んだ傾き | 6 か月 | 12 か月 | 24 か月 | すべての月 |
+|---|---|---|---|---|
+| 0.3 で一定 | +0.47 | +0.73 | +0.87 | +0.93 |
+| 0 のまわりでばらつき 0.4 | +0.58 | +0.48 | +0.20 | −0.12 |
+| 情報なし | −0.48 | −0.26 | −0.11 | −0.04 |
+| 情報の無い位置（式） | −0.46 | −0.23 | −0.12 | −0.05 |
+
+- 20 半期あれば、読みは仕込んだとおりに出ます。情報の無い因子が何かに見えたのは 40 回中 3 回で、6.7% の見込みと合います。
+- 8 半期（学習の組が 4 年）では、ばらつきの下限が 0.23 です。ばらつき 0.3 はそれより少し大きいだけなので、40 回中 15 回は `stable` に読まれました。下限の数を見れば、そのことは先に分かります。
+- 一定の傾きはすべての月で学び直すのがいちばん得で、動く傾きは短い窓ほど得です。情報の無い因子で `*` の付いた欄は、20 半期でも 8 半期でも 160 欄のうち 0 でした。
+
+鍵なしの手早い始め方の合成の例（種 7）では、`walkthrough.py` が survey も流します。事由 (b)（24 時間の動きが強ければ見送る）は 2022 年に向きが変わります。
+学習の組（2018〜2021 年）だけを調べると、(a) も (b) も `stable` で、(b) は `μ = +0.26`、`pq 12` が +1.69% * です。
+本番のあとに全部の組（2018〜2025 年）を調べると、(a) は `stable`（`μ = +0.26`、`share` 0.89、`pq all` +0.93% *）のままです。(b) は `moving`（`μ = +0.10`、`σ̂ = 0.20`、`share` 0.11、`pq all` −0.12%）になります。
+
+FX の事例研究の行（2022 年 1 月〜2026 年 10 月、5,170 件、負け 242 件）を、本番を流したあとの研究で全部の組について調べると、次のようになりました。
+
+- 状態の欄から作った 47 個の因子のうち、`stable` が 3 個、`moving` が 3 個、`none` が 41 個でした。偶然でも 3.2 個は何かに見えます。
+- 1 つの傾きで使える情報がいちばん大きい因子でも `H(Z)` の 0.24% で、1 年に 0.5 ナットしか集まりません。24 か月の窓でも約 1 ナットで、学ぶ費用で半分が消えます。
+- 学び直した利得に `*` の付いた欄はありませんでした（いちばん大きい欄で +0.35%、標準誤差 0.25）。ばらつきの下限は 0.23 で、それより小さい動きは見えません。
+- 2016 年 9 月からの行で調べた試作の数と比べると、数と真偽値の欄 32 個のうち 31 個で `μ` が 2 標準誤差の中に入りました。外れた 1 個と、それに近い 2 個は、値動きの大きさの水準を表す欄でした。2016〜2026 年では負の傾きがありましたが、2022 年からの行ではほぼ 0 です。
+
+## 8. 作った部分とまだ案の部分
+
+物差しは `src/yardsticks.py` にあり、作ってある物は次のとおりです。
+
+- そのままの利得（`asis_gain_pct`）。プロンプトの `forecast` に、どの問いのどの選択肢がどの結果を予想するかを書いたときに出ます。
+- 向きを保った利得（`transfer_gain_pct`）。評価と本番の組で出ます。
+- 当て直した利得（`cv_gain_pct`）。結果が 3 つ以上の値を取る場合と、1 行に問いが複数ある場合も扱います。V はすべての問いの答えを並べた特徴量（各選択肢の確率と、基準の選択肢の確率との対数比）から、結果の各値の確率を softmax で出す族です。結果が 2 値で問いが 1 つなら、3 章の `σ(a + b·logit s)` と同じ数になります。
+- 5 つの区間に分けた相互情報量から、並べ替えた結果での平均を引いた値（`mi_pct`）。結果が 2 値で、プロンプトが `forecast` を書いた場合だけ出ます。
+- でたらめな答えで測る 0 の位置。答えの形（問いの種類と選択肢の数）ごとに測ります。でたらめな答えは確率を散らす物（soft）と 1 つの選択肢に寄せる物（sharp）の 2 種類です。
+- 判定モデルの呼び出し。Vercel AI Gateway の `/v1/decisions` を使います（`src/gateway.py`）。
+- 7 章の、因子ごとの係数の時間変化の調べ（`plab survey`、`src/survey.py`）。判定モデルは呼ばず、状態の欄と機械の答えだけを読みます。
+
+まだ案の段階にある物は次の 2 つです。
+
+- 書く LLM の段（5 章）
+- 問いを作ってふるいにかける段
+
+[English README](README.en.md) · [手順とその理由 (英語)](docs/protocol.md) · [設計の決定 (ADR)](docs/adr/README.md)
+
+必要な物: Python 3.10 以上と numpy。ほかの依存はありません。
+
+## 鍵なしの手早い始め方
 
 ```sh
-git clone <this repository> prompt-lab && cd prompt-lab
-uv venv && uv pip install -e .          # or: python -m venv .venv && .venv/bin/pip install -e .
-python examples/synthetic/walkthrough.py --reset    # use the venv's python
+git clone <このリポジトリ> prompt-lab && cd prompt-lab
+uv venv && uv pip install -e .          # か: python -m venv .venv && .venv/bin/pip install -e .
+python examples/synthetic/walkthrough.py --reset    # .venv の python で
 ```
 
-The walkthrough makes 12,000 synthetic alerts (2018–2025, about 4.6% fail, a win is +2 and a failure
-−50) with three planted effects: (a) alerts between 13:00 and 15:59 UTC fail 1.6 times as often, in
-every year; (b) a strong move toward the alert direction makes failure 2.4 times as likely before
-2022 and *less* likely after; (c) volatility grows 2.5 times in 2022. Splits: training 2018–2021,
-evaluation 2022–2023, test 2024–2025. It then runs every command below, with the `machine` decider and
-the `fake` decider. What you will see (seed 7):
+合成の通知 12,000 件 (2018〜2025 年、約 4.6% が失敗、成功 +2・失敗 −50) を作り、3 つの効き目を仕込みます。
+(a) UTC 13:00〜15:59 の通知はどの年も 1.6 倍失敗しやすい。(b) 通知の向きへの強い動きは、2022 年より前は失敗を 2.4 倍にし、後は**減らす**。(c) 2022 年に値動きの大きさが 2.5 倍になる。
+分け方は 学習 2018〜2021・評価 2022〜2023・本番 2024〜2025。続けて、`machine` と `fake` (テスト用の作り物) を答える側にして、下のコマンドを全部流します。出る物は次の表のとおりです (乱数の種 7)。
 
-| prompt (machine decider) | training: cv_gain (percentile among random answers), AUC halves | evaluation: AUC, value per 1,000 vs take-everything |
+| プロンプト (答える側は machine) | 学習: cv_gain (でたらめな答えの中のパーセンタイル)、前半/後半の AUC | 評価: AUC、1,000 件あたりの値 (全部入るとの差) |
 |---|---|---|
-| (b) skip when `move_24h_toward > 12` | 0.69% (100th), 0.528 / 0.571, lift > 1 in every year | 0.464 (3rd percentile), **−78**; skips 12% → 29% because volatility grew |
-| (b) relative to volatility | | cv_gain 0.54% (100th) but AUC 0.460, **−140**: information with the wrong sign |
-| (a) skip 13:00–15:59 UTC | 0.52% (100th), 0.562 / 0.553 | 0.565, cv_gain 0.56% (100th), **+356** |
-| (a) or (b) | 1.12% (100th), the best in training | cv_gain −0.19% (74th), fails selection |
+| (b) `move_24h_toward > 12` なら見送る | 0.69% (100)、0.528 / 0.571、年ごとの持ち上げ倍率はどの年も 1 超 | 0.464 (3 パーセンタイル)、−78。値動きが大きくなり見送りが 12% → 29% |
+| (b) 値動きの大きさに対する比で書いた物 | | cv_gain 0.54% (100) なのに AUC 0.460・−140。向きが逆の情報 |
+| (a) UTC 13:00〜15:59 なら見送る | 0.52% (100)、0.562 / 0.553 | 0.565、cv_gain 0.56% (100)、+356 |
+| (a) か (b) | 1.12% (100)、学習ではいちばん良い | cv_gain −0.19% (74)、選ぶ決まりで落ちる |
 
-The selection rule picks (a); the single test run gives 3.84% failures among the 2,242 alerts taken
-(Wilson 95%: 3.1–4.7%) against 4.73% for taking all 3,042, and +12 in total instead of −1,404. A second
-`plab test --final` is refused. Across data seeds 1–10, (a) beats take-everything on the evaluation set
-in 10 of 10 and has a positive evaluation cv_gain in 7 of 10; (b) loses on the evaluation set in 10 of 10.
+選ぶ決まりは (a) を選び、本番の 1 回では、入った 2,242 件の失敗は 3.84% (Wilson の 95%: 3.1〜4.7%)、全部の 3,042 件に入ると 4.73%、合計の値は −1,404 に対して +12 でした。
+2 回目の `plab test --final` は断られます。データの乱数の種 1〜10 で、(a) は評価の組で 10 回中 10 回「全部入る」に勝ち、評価の cv_gain が正なのは 10 回中 7 回。(b) は 10 回中 10 回、評価の組で負けました。
 
-Each run also prints `asis_gain`, the gain of the decider's own probabilities. The machine answers
-exactly 0 or 1, so its as-is gain is far below zero (−1,991.51% for (a) in training): a sure forecast
-that is wrong costs about 20 bits. The recalibrated `cv_gain` does not pay that cost.
+どの結果にも、答える側が返した確率そのものの利得 `asis_gain` も出ます。machine の答えはちょうど 0 か 1 なので、そのままの利得は大きく負になります (学習の (a) で −1,991.51%)。言い切って外れた予想 1 件で約 20 ビットを失うためです。当て直した `cv_gain` にはこの損は入りません。
 
-## Using Jev
+## Jev の使い方
 
-1. Set the key in the environment: `AI_GATEWAY_API_KEY=...`, or `PLAB_KEY_FILE=/path/to/a/file/with/the/key`.
-   The key is never printed, logged or written to results (error texts are scrubbed). Do not copy the key
-   file into a task folder or a repository.
-2. In `task.json`, name the decider and set a budget. The default `deciders` already holds
-   `"jev": {"kind": "gateway", "model": "typesafe-ai/jev", "price_per_mtok": 0.042}`, and `"decider": "jev"`
-   is the default. Set `budget.usd`.
-3. Before calling, the harness estimates the cost and refuses if it exceeds the remaining budget
-   (`--yes` overrides). Real costs (from the gateway's response) go to the ledger,
-   `.plab/agents/<agent>/ledger.jsonl`; `plab cost` sums them.
-4. Each case is one call to `POST /v1/decisions`: the fields the prompt gives, as one JSON part, and the
-   questions. Answers are stored under `.plab/answers/`, keyed by the request, so cases that send the same
-   request share one call. An interrupted run continues
-   where it stopped, a request is never paid for twice, and editing an `expr` or a forecast reuses the
-   answers. `--cache-only` refuses to call at all.
-5. Calls: `gateway.workers` (6) in parallel. 429, 5xx and 529 are retried `gateway.retries` (4) times,
-   waiting as `Retry-After` says or 1, 2, 4 ... seconds. 401, 402 (no credit) and 403 stop the run, and so
-   does a reply that answers other questions; what was paid for so far is stored.
+1. 鍵を環境変数で渡す: `AI_GATEWAY_API_KEY=...`、または `PLAB_KEY_FILE=鍵を 1 行書いたファイルの道`。
+   鍵は画面・ログ・結果のファイルに出しません (誤りの文からも消します)。鍵のファイルを課題のフォルダやリポジトリに写さないでください。
+2. `task.json` で答える側と予算を決める。既定の `deciders` に `"jev": {"kind": "gateway", "model": "typesafe-ai/jev", "price_per_mtok": 0.042}` が入っていて、`"decider": "jev"` も既定です。`budget.usd` を書きます。
+3. 呼ぶ前に費用を見積もり、予算の残りを超えるなら断ります (`--yes` で押し切り)。実際の費用 (ゲートウェイの応答の値) は ledger の `.plab/agents/<エージェント>/ledger.jsonl` に積み、`plab cost` で合計を見ます。
+4. 1 件の呼び出しは 1 回の `POST /v1/decisions` で、プロンプトが渡す欄を 1 つの JSON にした物と、問いを送ります。答えは送った中身を鍵にして `.plab/answers/` に貯めるので、同じ中身を送る事例は 1 回の呼び出しを分け合います。途中で止まっても続きから流れ、同じ中身に 2 回払わず、`expr` や予想を直しても答えを使い回せます。`--cache-only` は呼び出しを一切しません。
+5. 並列は `gateway.workers` (6) 本。429・5xx・529 は `Retry-After` の言うとおりか 1・2・4… 秒待って `gateway.retries` (4) 回まで試し直します。401・402 (残高なし)・403 と、別の問いに答えた返事は、そこで流れを止めます。それまでに払った答えは貯めてあります。
 
-A typical full evaluation (1,000–1,300 calls of ~600 tokens) costs about $0.03–0.04.
+評価の組を 1 回まるごと数える (1,000〜1,300 回の呼び出し、1 回 約 600 トークン) と、約 $0.03〜0.04 です。
 
-To compare decision models on one prompt, add them to `deciders` and name several:
-`plab run P.json --agent A --decider jev --decider other`.
+1 つのプロンプトで判定モデルどうしを比べるには、`deciders` に足して複数指定します: `plab run P.json --agent A --decider jev --decider other`。
 
-## The study, step by step
+## 進め方
 
 ```
-plab init mytask            # task.json, prereg.md (template), prompts/
-#   put rows.jsonl in mytask/, edit task.json
-plab -C mytask split        # .plab/data/{train,eval,test}.jsonl by time
-plab -C mytask fields --auc # what is in the state (training split only)
-plab -C mytask survey       # does each factor's relation to the outcome hold across periods? (training split, free)
-#   searchers: write prompts, then
-plab lint P.json                            # wordings that lower model/machine agreement
-plab run P.json --decider machine --agent A # free: the exprs answer, on the training split
-plab run P.json --agent A                   # the task's decider on the training split
-plab agree P.json --agent A [--per-rule]    # does the model apply the rules like the machine?
-plab drift P.json --by year                 # does the rule hold in every period of training?
-#   the person running the study, before anyone looks at the evaluation split:
+plab init mytask            # task.json・prereg.md (雛形)・prompts/
+#   rows.jsonl を mytask/ に置き、task.json を直す
+plab -C mytask split        # 時刻で .plab/data/{train,eval,test}.jsonl に分ける
+plab -C mytask fields --auc # 状態の欄 (学習の組だけ)
+plab -C mytask survey       # 因子ごとに、結果との関係が期間をまたいで保たれるか (学習の組だけ、0 円)
+#   探す人: プロンプトを書いて
+plab lint P.json                            # モデルと機械の一致が下がる書き方
+plab run P.json --decider machine --agent A # 0 円: 式が答える。学習の組
+plab run P.json --agent A                   # 課題の答える側で学習の組
+plab agree P.json --agent A [--per-rule]    # モデルが機械と同じに当てはめるか
+plab drift P.json --by year                 # 学習の期間のどの区切りでも効くか
+#   研究を回す人が、だれかが評価の組を見る前に:
 plab prereg freeze
-#   searchers:
-plab check P.json --agent A [--decider NAME]     # ONE look at the evaluation split; capped per agent
-plab nominate P.json --agent A [--decider NAME]  # put forward at most N candidates
-#   the person running the study:
-plab select                 # applies the frozen selection rule; writes .plab/selected.json or "none"
-plab test --final           # the selected candidate on the test split, once
-plab report                 # looks at the evaluation split, selection, test table, cost
+#   探す人:
+plab check P.json --agent A [--decider 名前]     # 評価の組を 1 回見る。1 人あたり上限つき
+plab nominate P.json --agent A [--decider 名前]  # 推す (N 本まで)
+#   研究を回す人:
+plab select                 # 固定した選ぶ決まりを当てて .plab/selected.json か「なし」を書く
+plab test --final           # 選ばれた 1 本を本番の組に 1 回だけ
+plab report                 # 評価の組を見た回数・選んだ物・本番の表・費用
 ```
 
-What is measured, nominated and selected is a candidate: a prompt and a decider. `plab brief --agent A
---direction "..."` prints the instructions to hand to a searching agent: what it may read, what it must
-not open, which commands it may run, its caps, and how to report back. In Claude Code, the skill
-[plab-search](.claude/skills/plab-search/SKILL.md) (in Japanese) takes that brief and keeps writing,
-measuring and revising prompts until it nominates. Before any search, the skill
-[plab-survey](.claude/skills/plab-survey/SKILL.md) runs `plab survey` and decides whether a search is
-worth starting.
+測り、推し、選ぶ単位はプロンプトと答える側の組です。`plab brief --agent A --direction "..."` は、探すエージェントに渡す指示 (読んでよい物・開いてはいけない物・使ってよいコマンド・上限・報告の形) を出します。
+Claude Code で探すときは、スキル [plab-search](.claude/skills/plab-search/SKILL.md) がこの指示を受け取り、案を書いて測り、直し続けて推すところまで進めます。
+探し始める前には、スキル [plab-survey](.claude/skills/plab-survey/SKILL.md) が `plab survey` を流し、探索を始めるかを決めます。
 
-Commands take `-C DIR` (the task folder; default: the current folder). Refusals exit with code 2.
+コマンドは `-C DIR` (課題のフォルダ。既定は今のフォルダ) を取ります。断るときの終わりの番号は 2 です。
 
-| command | reads | notes |
+| コマンド | 読む組 | 補足 |
 |---|---|---|
-| `init DIR` | – | writes templates; `prereg.md` carries a mark that `freeze` refuses until you fill it in |
-| `migrate [--write] [--unfreeze]` | – | converts a prompt-lab 0.1 task folder (see below) |
-| `split [--force]` | rows.jsonl | refused after freeze |
-| `fields [--auc]` | train | fill rate, quantiles, top values; `--auc` (two classes): single-field AUC on the weighted training sample |
-| `lint PROMPT` | train | warnings (lesson 3), an expr compared with None (it never holds), what the machine cannot answer, fields named but not given |
-| `run PROMPT [--decider NAME ...]` | train | logged to `runs.jsonl`; several `--decider` print the deciders side by side |
-| `agree PROMPT [--decider NAME] [--per-rule] [--limit N]` | train | every question the machine can answer (rules with an `expr` on each, or an `expr`): a yes/no answer at the decision threshold, a choice or score by the option it gives the most probability, against the machine, leaving out units either one refused; disagreeing ids |
-| `drift PROMPT [--decider NAME] [--by quarter\|half\|year]` | train | by period: with `decision` and a forecast, rule hits, positive rates and value; otherwise each question's answers by option and the outcome among them |
-| `survey [PROMPT] [--by quarter\|half\|year] [--gap MONTHS] [--splits train\|all]` | train (`all`: every split) | the state fields, or a prompt's rules and questions as the machine answers them, as factors: each one's slope by period, its mean and spread, and the gain of re-learning it (see the yardsticks). Writes nothing on the training split; `--splits all` runs only on a closed study, is marked EXPLORATORY and is logged to `surveys.jsonl` |
-| `null PROMPT [--split train\|eval] [--force]` | train, eval | the zero point for the prompt's answer shape (stored per split and shape); `eval` needs freeze |
-| `prereg freeze [--force]\|status` | – | hashes prereg.md, the locked settings of task.json and the split files |
-| `check PROMPT --agent A [--decider NAME]` | eval | freeze required; cap `budget.eval_checks_per_agent`; every check logged |
-| `nominate PROMPT --agent A [--decider NAME]` | – | cap `budget.nominations_per_agent`; stores the prompt itself |
-| `select` | train, eval | re-measures each nomination; its looks are logged as agent `select` |
-| `test --final [--resume]` | test | refused without a selection, and the second time |
-| `board [--split train\|eval] [--agent A] [--all] [--top N]` | logs | the evaluation board shows one agent's own checks unless `--all` |
-| `cost`, `report [--json]`, `brief --agent A [--direction TEXT]` | logs | |
+| `init DIR` | – | 雛形を書く。`prereg.md` には印があり、埋めるまで `freeze` が断る |
+| `migrate [--write] [--unfreeze]` | – | prompt-lab 0.1 の課題のフォルダを直す (下を見る) |
+| `split [--force]` | rows.jsonl | freeze の後は断る |
+| `fields [--auc]` | 学習 | 埋まり・分位・多い値。`--auc` (2 値) は重みつきの学習の標本での欄ごとの AUC |
+| `lint PROMPT` | 学習 | 警告 (教訓 3)・None と比べる expr (当たることがない)・machine が答えられない所・名前は出るのに渡していない欄 |
+| `run PROMPT [--decider 名前 ...]` | 学習 | `runs.jsonl` に記録。`--decider` を複数付けると答える側を並べて出す |
+| `agree PROMPT [--decider 名前] [--per-rule] [--limit N]` | 学習 | 機械が答えられる問い (全部の事由に `expr` がある問いか、`expr` のある問い) ごとに、答える側と機械の一致。はい・いいえの答えは判定の境で、choice と score はいちばん確率の高い選択肢で比べる。どちらかが断った行は外して数える。食い違った id |
+| `drift PROMPT [--decider 名前] [--by quarter\|half\|year]` | 学習 | 区切りごとに、`decision` と予想があれば事由の当たり方・正例の率・値、なければ問いごとの選択肢の割合とその中の結果 |
+| `survey [PROMPT] [--by quarter\|half\|year] [--gap 月数] [--splits train\|all]` | 学習 (`all` は全部) | 状態の欄か、プロンプトの事由と問い (機械の答え) を因子にして、期間ごとの傾きの平均とばらつき、学び直した利得を出す (7 章)。学習の組だけなら何も書かない。`--splits all` は本番のあとの閉じた研究でだけ流れ、探索用の印を付けて `surveys.jsonl` に記録する |
+| `null PROMPT [--split train\|eval] [--force]` | 学習・評価 | プロンプトの答えの形での 0 の位置 (組と形ごとに保存)。`eval` は freeze が要る |
+| `prereg freeze [--force]\|status` | – | prereg.md・task.json の固定する設定・分けたファイルのハッシュを固定 |
+| `check PROMPT --agent A [--decider 名前]` | 評価 | freeze が要る。上限 `budget.eval_checks_per_agent`。全部記録 |
+| `nominate PROMPT --agent A [--decider 名前]` | – | 上限 `budget.nominations_per_agent`。プロンプトの中身ごと保存 |
+| `select` | 学習・評価 | 推された物を測り直す。その確かめも agent `select` として記録 |
+| `test --final [--resume]` | 本番 | 選ばれた物が無いときと 2 回目は断る |
+| `board [--split train\|eval] [--agent A] [--all] [--top N]` | 記録 | 評価の表は `--all` が無ければ自分の確かめだけ |
+| `cost`・`report [--json]`・`brief --agent A [--direction 文]` | 記録 | |
 
-Flags on measuring commands: `--agent NAME`, `--decider NAME`, `--cache-only`, `--yes`, `--json`.
+測るコマンドの旗: `--agent 名前`・`--decider 名前`・`--cache-only`・`--yes`・`--json`。
 
-### Convert a prompt-lab 0.1 folder
+### prompt-lab 0.1 のフォルダを直す
 
-`plab -C OLD migrate` prints what it would change; add `--write` to do it. It rewrites `task.json` into
-format 2 from the 0.1 settings and 0.1's own defaults (the old file is kept as `task.v1.json`), moves the
-answers 0.1 paid for into the store (marked `via: "evaluate"`), and makes the 0.1 ledger the ledger of the
-agent `migrate`, so it still counts against the budget. Prompt files and split files stay as they are.
-A score question's answers are not moved, because 0.1 kept only score/(levels − 1). The old cache, logs
-and zero points are set aside under `.plab/archive-v0.1/`. A study frozen under 0.1 is refused unless
-you pass `--unfreeze`, which also sets aside its lock, checks, nominations and selection; a study that
-started its test is never migrated. When one table holds answers from both endpoints, the result prints the
-count from each.
+`plab -C 古いフォルダ migrate` は何を変えるかを出し、`--write` を付けると実際に変えます。
+`task.json` を 0.1 の設定と 0.1 自身の既定値から format 2 に書き直し (元のファイルは `task.v1.json` に残す)、0.1 が払って得た答えを今の置き場に移し (`via: "evaluate"` の印を付ける)、0.1 の ledger をエージェント `migrate` の ledger にするので、払った分は予算に数えたままです。プロンプトのファイルと分けたファイルはそのままです。
+score の問いの答えは移しません。0.1 は score/(段階の数 − 1) しか残していないためです。古いキャッシュ・記録・0 の位置は `.plab/archive-v0.1/` に寄せます。
+0.1 で固定した研究は `--unfreeze` を付けない限り断ります。付けると、固定・確かめ・推薦・選択も寄せて、固定する前に戻します。本番を始めた研究は直しません。
+1 つの表に両方の窓口の答えが混じるときは、結果にそれぞれの数が出ます。
 
-## Files
+## ファイルの形
 
-### rows.jsonl (one case per line)
+### rows.jsonl (1 行 = 1 事例)
 
 ```json
 {"id": "a00017", "t": "2018-01-03T14:05:00Z", "state": {"time_utc": "14:05", "vol_24h": 18.2, "...": "..."}, "label": 1, "value": -50.0}
 ```
 
-The outcome is one of `outcome.classes` (`true` and `false` read as 1 and 0, a whole number as its
-integer, then matched as text). `value` is what taking the case is worth; leave it out, and set
-`rows.value` to `null`, when cases have none. `t` is ISO 8601 or epoch seconds (naive times are read as
-UTC). Keep dates, years and absolute prices out of the state if the model might remember what happened.
+結果は `outcome.classes` のどれか (`true`・`false` は 1・0 と読み、整数の値は整数にしてから文字として照らす)。`value` はその事例に入ったときの値で、値の無い課題では書かずに `rows.value` を `null` にします。`t` は ISO 8601 か UNIX 時刻の秒 (時差の無い時刻は UTC と読む)。
+モデルが実際の出来事を覚えているかもしれないなら、日付・年・絶対の価格を状態に入れないこと。
 
 ### task.json
 
-`"format": 2` is required. Every other key has a default; objects merge into the default, lists replace
-it, and `selection` replaces it whole. Keys starting with `_` are ignored (use them for notes).
+`"format": 2` は必ず書きます。ほかの鍵には既定があり、オブジェクトは既定に重ね、リストは置き換え、`selection` は丸ごと置き換えます。`_` で始まる鍵は読みません (メモに使える)。
 
-| key | meaning (default) |
+| 鍵 | 意味 (既定) |
 |---|---|
-| `name` | the study's name (`task`) |
-| `rows` | `file`, and the names of `id`, `time`, `outcome`, `value` and `state` in a row (`rows.jsonl`, `id`, `t`, `label`, `null`, `state`) |
-| `outcome` | `classes`: two or more, in index order (`["0", "1"]`); `meaning`: free text per class, shown to searchers. Class 0 is the reference class, the common case. With two classes, class 1 is the positive class |
-| `splits` | `{"train": [start, end), "eval": [...], "test": [...] or absent}`, in time order |
-| `cv_groups` | `month`, `week`, `day`, `row` or a state field: rows of one group stay in one CV fold (`month`) |
-| `half_boundary` | training rows before it are half 1, the rest half 2 (for half AUCs and the cross-fit) |
-| `train_sample` | `{"reference_per_other": 6, "seed": 12345}`: every row outside class 0, plus N class-0 rows for each, weighted back (`null`: every row) |
-| `decision` | the veto use, `{"skip_if_prob_at_least": 0.5}`: needs two classes and `rows.value` (`null`) |
-| `state_fields` | `"all"` or a list: the fields a prompt may give to the decider |
-| `field_groups` | named lists of fields, usable as a prompt's `fields` |
-| `rule_frame` | `head` and `tail`: the text around the rules of a rules question (generic English; rewrite it for your domain) |
-| `selection` | `require`: list of `{metric, op, value}`; `rank_by`: list of `{metric, order}` (see below) |
-| `budget` | `usd` (0), `eval_checks_per_agent` (10), `nominations_per_agent` (2) |
-| `deciders` | name → `{"kind": ...}`: `machine` (no settings), `fake` (`cost_per_call`), `gateway` (`model`, `price_per_mtok`). Defaults: `machine`, `fake`, `jev` |
-| `decider` | the decider a command uses when `--decider` is not given (`jev`) |
-| `gateway` | `workers` (6), `retries` (4), `timeout_s` (120) |
-| `metrics` | `cv_folds` (10), `cv_reps` (3), `mi_perms` (500), `null_reps` (200), `null_seed` (777) |
+| `name` | 研究の名前 (`task`) |
+| `rows` | `file` と、行の中の `id`・`time`・`outcome`・`value`・`state` の名前 (`rows.jsonl`・`id`・`t`・`label`・`null`・`state`) |
+| `outcome` | `classes`: 2 つ以上、番号の順 (`["0", "1"]`)。`meaning`: 値ごとの自由な文、探す人に見せる。値 0 は基準の値でいちばんよくある場合。2 値なら値 1 が正例 |
+| `splits` | `{"train": [始め, 終わり), "eval": [...], "test": [...] か無し}`。時刻の順 |
+| `cv_groups` | `month`・`week`・`day`・`row` か状態の欄。同じ組の行は交差検証の同じ分け目に入る (`month`) |
+| `half_boundary` | 学習の行で、これより前が前半、後が後半 (前半/後半の AUC と交差当てはめに使う) |
+| `train_sample` | `{"reference_per_other": 6, "seed": 12345}`: 値 0 以外の行は全部・値 0 の行はその N 倍、重みで戻す (`null`: 全部の行) |
+| `decision` | 見送りの使い方 `{"skip_if_prob_at_least": 0.5}`。2 値と `rows.value` が要る (`null`) |
+| `state_fields` | `"all"` か一覧: プロンプトが答える側に渡してよい欄 |
+| `field_groups` | 欄の一覧に名前を付けた物。プロンプトの `fields` に使える |
+| `rule_frame` | `head`・`tail`: 事由の問いの前置きと結び (既定は汎用の英文。領域に合わせて書き換える) |
+| `selection` | `require`: `{metric, op, value}` の並び。`rank_by`: `{metric, order}` の並び (下を見る) |
+| `budget` | `usd` (0)・`eval_checks_per_agent` (10)・`nominations_per_agent` (2) |
+| `deciders` | 名前 → `{"kind": ...}`。`machine` (設定なし)・`fake` (`cost_per_call`)・`gateway` (`model`・`price_per_mtok`)。既定は `machine`・`fake`・`jev` |
+| `decider` | `--decider` が無いときに使う答える側 (`jev`) |
+| `gateway` | `workers` (6)・`retries` (4)・`timeout_s` (120) |
+| `metrics` | `cv_folds` (10)・`cv_reps` (3)・`mi_perms` (500)・`null_reps` (200)・`null_seed` (777) |
 
-`prereg freeze` locks every setting except `name`, `budget.usd`, `gateway` and the prices of the deciders.
+`prereg freeze` は、`name`・`budget.usd`・`gateway`・答える側の料金を除く全部の設定を固定します。
 
-A selection metric is `train.` or `eval.` and then a record field: `cv_gain_pct`, `asis_gain_pct`,
-`null_pct.cv_gain_pct`, `n`, `missing`, `refused`, `class_counts.<class>`; on evaluation also
-`transfer_gain_pct` and `null_pct.transfer_gain_pct`; with two classes also `auc`,
-`mi_pct`, `mi_p`, `null_pct.auc`, `null_pct.mi_pct`, and `auc_h1`, `auc_h2` (training, with
-`half_boundary`); with `decision`, `decision.value_per_1000` and the other numbers of the decision table;
-with two classes, values and `half_boundary`, `xfit.value_per_1000`, `xfit.keep_frac`,
-`xfit.kept_neg_pct` (training). Loading refuses a rule that reads a number the task cannot produce. The
-default rule requires a positive cv_gain on both splits and a positive evaluation value, so a task
-without `decision` must state its own.
+選ぶ決まりの指標は `train.` か `eval.` に記録の欄を続けた物です: `cv_gain_pct`・`asis_gain_pct`・`null_pct.cv_gain_pct`・`n`・`missing`・`refused`・`class_counts.<値>`。評価なら `transfer_gain_pct`・`null_pct.transfer_gain_pct`。2 値なら `auc`・`mi_pct`・`mi_p`・`null_pct.auc`・`null_pct.mi_pct` と、`auc_h1`・`auc_h2` (学習、`half_boundary` が要る)。`decision` があれば `decision.value_per_1000` などの判定の表の数。2 値で値と `half_boundary` があれば `xfit.value_per_1000`・`xfit.keep_frac`・`xfit.kept_neg_pct` (学習)。
+課題が出せない数を読む決まりは、読み込むときに断ります。既定の決まりは両方の組での正の cv_gain と評価の組での正の値を求めるので、`decision` の無い課題では自分の決まりを書きます。
 
-### Prompts
+### プロンプト
 
 ```json
 {"name": "afternoon window",
  "fields": ["event", "side", "time_utc"],
  "questions": [{"name": "skip", "type": "predicate", "rules": [
    {"text": "(a) Skip when time_utc is between 13:00 and 15:59 inclusive.", "expr": "'13:00' <= time_utc <= '15:59'"},
-   "(b) A rule in words only, without expr."]}],
+   "(b) 式の無い、言葉だけの事由。"]}],
  "forecast": {"question": "skip", "classes": {"yes": "1", "no": "0"}}}
 ```
 
-- `fields`: `"all"`, a name from `field_groups`, or a list of state fields. The decider reads these
-  fields only.
-- `questions`: 1 to 6, each with a `name` and a `type`:
-  - `predicate`: yes or no. Either `instructions` and an optional `expr`, or `rules`: 1 to 12 rules,
-    each a text or `{"text", "expr"}`. A rules question is asked as `rule_frame.head` + the rule texts
-    + `rule_frame.tail`, and the machine says yes when any rule applies.
-  - `choice`: `instructions` and `choices`, 2 to 255 options, each a text or `{"value", "description"}`.
-    An `expr` gives the option the machine chooses.
-  - `score`: `instructions` and `levels`, 2 to 10, each a text or `{"label", "description"}`. An `expr`
-    gives the level index.
-- `forecast`: what the answers say about the outcome.
-  - `{"question": NAME, "classes": {option: class}}`: every option of one question forecasts a class.
-    The decider's own probabilities are then a forecast, which gives the as-is gain and, with two
-    classes, AUC, binned MI and the decision table.
-  - `"fitted"`: the forecast is V fitted on the training answers. On the training split it is out of fold, so its AUC is taken
-    within each fold and averaged, and binned MI, the quintiles and the cross-fit, which compare units of different folds, are
-    left out. Pooled over folds they read a weak answer wrong: its AUC fell below 0.5 and its MI rose.
-    There is no as-is gain.
-  - absent: the prompt is measured by cv_gain alone.
+- `fields`: `"all"`、`field_groups` の名前、または状態の欄の一覧。答える側はこの欄だけを読みます。
+- `questions`: 1〜6 個。それぞれ `name` と `type` を持ちます。
+  - `predicate`: はい・いいえ。`instructions` と任意の `expr` か、`rules` (1〜12 個。文か `{"text", "expr"}`) のどちらか。事由の問いは `rule_frame.head` + 事由の文 + `rule_frame.tail` として聞き、機械はどれかの事由が当てはまれば「はい」と答えます。
+  - `choice`: `instructions` と `choices` (2〜255 個。文か `{"value", "description"}`)。`expr` は機械が選ぶ選択肢を返します。
+  - `score`: `instructions` と `levels` (2〜10 個。文か `{"label", "description"}`)。`expr` は段階の番号を返します。
+- `forecast`: 答えが結果について何を言うか。
+  - `{"question": 名前, "classes": {選択肢: 値}}`: 1 つの問いの選択肢ごとに、予想する結果の値を書く。答える側の確率そのものが予想になり、そのままの利得が出ます。2 値なら AUC・区間に分けた相互情報量・判定の表も出ます。
+  - `"fitted"`: 学習の組の答えに当てはめた V を予想にする。そのままの利得は出ません。学習の組では外の予測なので、AUC は分割の中で測って平均し、分割をまたいで行を比べる区間 MI・五分位・交差当てはめは出しません。分割をまとめて測ると、弱い答えの AUC が 0.5 を下回り、MI は膨らんだためです。
+  - 無し: cv_gain だけで測る。
 
-A task with three classes might ask a choice and a predicate:
+結果が 3 つの値を取る課題なら、choice と predicate を 1 つずつ聞く形もあります。
 
 ```json
 {"name": "route", "fields": ["topic", "x"],
@@ -260,164 +504,67 @@ A task with three classes might ask a choice and a predicate:
  "forecast": {"question": "queue", "classes": {"other": "other", "billing": "billing", "shipping": "shipping"}}}
 ```
 
-The two prompt forms of prompt-lab 0.1 still load for a two-class task: `veto_rules` (one rules
-predicate whose yes forecasts class 1), and `questions` as an object beside `score`.
+prompt-lab 0.1 の 2 つの形も、2 値の課題ならそのまま読めます: `veto_rules` (「はい」が値 1 を予想する事由の問い 1 つになる) と、`score` を添えたオブジェクトの `questions`。
 
-**`expr`** is a small, safe language (parsed with `ast`, never `eval`): field names, numbers, strings,
-`True/False/None`, tuples/lists, comparisons (`== != < <= > >= in, not in`, chained), `and/or/not`,
-`+ - * /`, `abs/min/max/len`, and subscripts/slices. An `expr` may only read fields that the prompt gives
-to the decider. **If a field it reads is null (or a list element it uses is null), or the computation fails
-(type mismatch, division by zero), the expr has no value: a rule does not apply, a predicate says no, and a
-choice or score counts as refused.**
+`expr` は小さな安全な言葉です (`ast` で読み、`eval` は使わない): 欄の名前・数・文字列・`True/False/None`・タプル/リスト・比べ (`== != < <= > >= in, not in`、連ねてもよい)・`and/or/not`・`+ - * /`・`abs/min/max/len`・添字/切り出し。
+`expr` が読めるのは、そのプロンプトが答える側に渡す欄だけです。読む欄が null (使うリストの要素が null も同じ) か、計算が失敗した (型の食い違い・0 での割り算) ときは、式に値がありません。事由は当てはまらず、predicate は「いいえ」、choice と score は答えを断った扱いです。
 
-The prompt id is a hash of the fields, the questions as asked, their exprs and the forecast, not of the
-name. The answer store is keyed by what the decider reads: a gateway model reads the request only, so
-editing an expr or the forecast reuses its answers.
+プロンプトの指紋は渡す欄・聞く形の問い・その式・予想のハッシュで、名前は含めません。答えの置き場は答える側が読む物を鍵にします。Gateway のモデルが読むのは送った中身だけなので、式や予想を直しても答えを使い回せます。
 
-### .plab/ (written by the harness, append-only where it is a log)
+### .plab/ (ハーネスが書く。記録は追記だけ)
 
-| file | content |
+| ファイル | 中身 |
 |---|---|
-| `data/{train,eval,test}.jsonl` | the split rows, in time order |
-| `answers/<shelf>/meta.json`, `answers/<shelf>/<agent>.jsonl` | what one shelf of stored answers was asked (model and questions), and the answers each agent fetched |
-| `nulls/<split>.<signature>.json` | the zero point of one split and answer shape |
-| `agents/<agent>/{runs,checks,nominations,agree,ledger,surveys}.jsonl` | the logs, one file per agent: training runs, looks at the evaluation split (agents and `select`), nominations (with the prompt itself), agreement checks, decider calls with their cost, surveys of every split of a closed study |
-| `prereg.lock`, `prereg.frozen.md` | the frozen hashes and a copy of prereg.md |
-| `selected.json` | the selection |
-| `test.lock`, `test_result.json` | the one test run |
+| `data/{train,eval,test}.jsonl` | 分けた行 (時刻の順) |
+| `answers/<棚>/meta.json`・`answers/<棚>/<エージェント>.jsonl` | 貯めた答えの 1 つの棚で何を聞いたか (モデルと問い) と、エージェントごとに取った答え |
+| `nulls/<組>.<形>.json` | 1 つの組と答えの形での 0 の位置 |
+| `agents/<エージェント>/{runs,checks,nominations,agree,ledger,surveys}.jsonl` | エージェントごとの記録: 学習の組の結果、評価の組を見た全部の記録 (エージェントと `select`)、推された物 (プロンプトの中身ごと)、一致の確かめ、答える側の呼び出しと費用、閉じた研究で全部の組を調べた survey |
+| `prereg.lock`・`prereg.frozen.md` | 固定したハッシュと prereg.md の写し |
+| `selected.json` | 選んだ結果 |
+| `test.lock`・`test_result.json` | 1 回だけの本番 |
 
-## The yardsticks
+## 物差し
 
-Z is the outcome with K ≥ 2 classes; class 0 is the reference. Each unit has a weight w (1 everywhere
-except in a down-sampled training split). The theory at the top of [README.ja.md](README.ja.md) gives the reasons.
+Z は K ≥ 2 個の値を取る結果で、値 0 が基準です。どの事例にも重み w があります (間引いた学習の組以外では 1)。理由はこの README の 1〜4 章 にあります。
 
-**The answers, encoded.** An answer is a probability over a question's options. A predicate gives
-logit(P(yes)), a choice gives log(p_j / p_0) for each option after the first, and a score gives one
-column, logit(mean level / (levels − 1)). Probabilities are clipped to [1e-4, 1 − 1e-4] first. A choice
-answered without probabilities is a point mass on the chosen option. A refused question counts as the
-uniform answer: its unit stays in, and the record counts it in `refused`.
+答えの並べ方。答えは問いの選択肢の上の確率です。predicate は logit(はいの確率)、choice は先頭以外の選択肢ごとに log(p_j / p_0)、score は 1 列で logit(平均の段階 / (段階の数 − 1)) にします。確率は先に [1e-4, 1 − 1e-4] に収めます。確率なしで選択肢だけを返した choice は、その選択肢に全部を置いた答えとして扱います。断られた問いは一様な答えとして測り、事例は落とさず、記録の `refused` に数えます。
 
-Information, for any K and any number of questions:
+情報の物差しは次のとおりです。K も問いの数も問いません。
 
-- **cv_gain_pct**, the recalibrated gain: V is a multinomial logistic regression (softmax, class 0 as
-  reference) on the encoded answers of every question, fitted out of fold (10 folds grouped by
-  `cv_groups`, 3 repeats, seeds 100 + r, a 1e-3 ridge on the slopes). The result is
-  100 · (H(Z) − cross-entropy) / H(Z). It estimates the V-information of the answers about the outcome.
-  With one predicate and two classes it is exactly the number 0.1.0 gave. **Sign-blind.**
-- **transfer_gain_pct**, the gain in the training direction (evaluation and test): V is fitted on all
-  training answers, and its slopes give each case a score E per class. On the split measured, E stays
-  fixed and only the intercepts and one strength c ≥ 0 are fitted, out of fold with the folds of
-  cv_gain. An answer whose relation to the outcome turned around falls to the zero point; one whose
-  relation only weakened keeps a positive gain. It fits one number more than the constant forecast,
-  whatever the number of columns. Measuring evaluation or test also reads the training answers (asking
-  the decider for those not stored); the record counts those without an answer (`trained_on`). **Sign-aware.** See
-  [ADR-0011](docs/adr/0011-transfer-gain-keeps-the-training-direction.md).
-- **asis_gain_pct**, the as-is gain: the same share for the decider's own probabilities, through the
-  prompt's `forecast`. Nothing is fitted, so it can be below zero on any number of units;
-  cv_gain − asis_gain is what trusting the raw probabilities costs. **Sign-aware.**
+- `cv_gain_pct` (当て直した利得): すべての問いの答えを並べた物に、多値のロジスティック回帰 (softmax、値 0 が基準) を V として当てはめ、外の予測にする (`cv_groups` でまとめた 10 分割 × 3 回、種 100 + r、傾きにだけ 1e-3 のリッジ)。結果は 100 · (H(Z) − 交差エントロピー) / H(Z)。答えが結果について持つ V-information の推定です。2 値で predicate が 1 つなら、0.1.0 とまったく同じ数になります。**向きを見ない。**
+- `transfer_gain_pct` (向きを保った利得、評価と本番の組): 学習の組のすべての答えに V を当てはめ、切片を除いた係数で行ごとに結果の各値の得点 E を作る。測る組では E を固定し、切片と 0 以上の倍率 1 つだけを、cv_gain と同じ分割で当てはめて外の予測にする。向きが逆になった答えは 0 の位置まで落ち、効き目が弱まっただけの答えは正のまま残る。答えの列の数によらず、当てはめる数は定数の予測より 1 つ多いだけ。評価と本番の組を測るときは、学習の組の答えも使う (記録に無ければ判定モデルに聞き、答えの無かった行の数を記録の `trained_on` に残す)。向きを見る。
+- `asis_gain_pct` (そのままの利得): プロンプトの `forecast` を通した、答える側の確率そのものでの同じ割合。何も当てはめないので、行がいくら多くても負になりえます。cv_gain − asis_gain が、確率を当て直さずに信じたときに失う量です。向きを見る。
 
-Use, for two classes and a forecast (s is the forecast probability of class 1):
+使い道の物差しは次のとおりです。2 値で予想があるときに出ます。s は値 1 を予想する確率です。
 
-- **AUC** (weighted, ties count half), and on each training half. **Sign-aware.**
-- **mi_pct**, binned MI: s in 5 bins of equal weight, the mutual information with Z minus the mean of 500
-  shuffles, in % of H(Z), with its permutation p. It fits no model. **Sign-blind.**
-- **Positive rate by forecast quintile.**
-- **Decision** (with `decision` and values): skip when s ≥ the threshold. The skip share, the positive and
-  negative rates among the cases taken, the positive rate among those skipped and the lift, the value per
-  1,000 cases, and the same for taking everything. **Sign-aware.**
-- **Cross-fit** (training, with values and `half_boundary`): the best skip share (5% steps) chosen on one
-  half and applied to the other, both ways. **Sign-aware.**
-- **Test**: cases taken, positive and negative rates with Wilson 95% intervals, value per case and in
-  total, AUC with a one-sided permutation p, and binned MI; next to taking everything.
+- AUC (重みつき、同順位は半分) と、学習の前半・後半の AUC。向きを見る。
+- `mi_pct` (区間に分けた相互情報量): s を重みの等しい 5 つの区間に分け、Z との相互情報量から 500 回の並べ替えの平均を引いて H(Z) に対する %、と並べ替えの p。模型を当てはめない確かめです。**向きを見ない。**
+- 予想の 5 分位ごとの正例の率。
+- 判定どおり (`decision` と値があるとき): s が境以上なら見送る。見送りの割合、入った事例の正例と負例の率、見送った側の正例の率と倍率、1,000 件あたりの値、全部入った場合の同じ数。向きを見る。
+- 交差当てはめ (学習、値と `half_boundary` があるとき): 片方の半分で最適の見送りの割合 (5% 刻み) を決めてもう片方に当てる (逆も)。向きを見る。
+- 本番: 入った件数、正例と負例の率と Wilson の 95% の幅、1 件あたりと合計の値、AUC と片側の並べ替えの p、区間に分けた相互情報量。全部入る場合と並べる。
 
-**Zero point.** The same yardsticks on random answers of the prompt's shape (the kind and number of
-options of every question and, with two classes, which options forecast class 1), keeping the split's labels, weights and
-groups. There are two kinds, 200 of each: *soft* answers spread their probability at random, and
-*sharp* answers put all of it on one option. A result is placed among the sharp kind when at least 90%
-of its weight has at most 0.15 of its probability off one option on every question, and among the soft
-kind otherwise. Every record prints its percentile. On evaluation and test, the direction of
-`transfer_gain_pct` comes from V fitted on other random answers.
+時間をまたいで残る情報 (`plab survey`)。表の `mu`・`sigma`・`share`・`info%`・`nats/yr`・`pq` の定義と読み方は 7 章にあります。
 
-### Information that holds across time (`plab survey`)
+0 の位置。同じ物差しを、プロンプトと同じ形 (問いごとの種類と選択肢の数、2 値なら値 1 を予想する選択肢) のでたらめな答えで測ります。組のラベル・重み・グループはそのままです。
+でたらめな答えは 2 種類で各 200 回: 確率をでたらめに散らす *soft* と、全部を 1 つの選択肢に置く *sharp*。重みの 90% 以上で、どの問いでも 1 つの選択肢の外にある確率が 0.15 以下なら sharp の側に、そうでなければ soft の側に置きます。どの記録にも、その中のパーセンタイルが出ます。評価と本番の組の `transfer_gain_pct` の向きは、別のでたらめな答えに当てはめた V から作ります。
 
-Section 7 of [README.ja.md](README.ja.md) is the source; this is its English counterpart. Here t is
-time and F a factor: one number per case, such as a state field, whether a text field takes a value,
-or a rule or question of a prompt as the machine (`expr`) answers it. (The T of the theory above is
-what the decider reads, a different thing.)
+## ハーネスが強制すること・できないこと
 
-**The split.** I(Z;F|t) = I(Z;F) + [I(Z;F|t) − I(Z;F)], and the bracket equals I(Z;t|F) − I(Z;t). The
-first term is what one relation over all periods can use; the bracket rides on how the relation
-changes with time (it is −I(Z;F) when F and Z are independent given t). A search that writes fixed
-rules reaches the first term only.
+強制すること: 時刻で分けること。評価の確かめ・選択・本番には、固定して変わっていない事前登録が要ること。1 人あたりの上限。評価の組を見た全部の記録。選択が決まりどおりであること。本番は選ばれた物に 1 回だけ。予算。`expr` は答える側が見る欄しか読めないこと。
 
-**A stale slope.** A forecast q fitted at another time scores gain(q) = I_t − E KL(p_t ‖ q), I_t =
-I(Z;F|t), against the period's own base rate. With F standardized, a class share π and a weak effect,
-I_t ≈ κ b_t² with κ = π(1 − π)/2 nats. A slope fixed at b (intercept refitted) loses about κ(b − b_t)²,
-so it keeps κ(2 b b_t − b²). With μ and σ² the mean and the between-period variance of the true slope,
-the best fixed slope is b = μ and keeps κμ² on average, of the κ(μ² + σ²) a slope known in every period
-would use: the stable share μ²/(μ² + σ²). With several columns, the angle θ between the learned and the
-current coefficients keeps I_t cos²θ; `transfer_gain_pct` refits a strength c ≥ 0, so for one factor
-only a reversed sign costs. At π = 5%, κb² is within 0.7% of the exact I(Z;F) (Gauss-Hermite) at
-b = 0.3 and within 2.1% at b = 0.5; it overstates by 13% at b = 1 (32% at π = 40%), so read strong
-factors by the re-learning columns.
+ソフトウェアでは強制できないこと: だれも `rows.jsonl` や `.plab/data/eval.jsonl` を直接開かないこと。brief が探すエージェントに禁じ、道具を通した確かめは記録で数えられます。評価と本番のファイルは封をした封筒として扱ってください。
 
-**The estimate.** The factor's midranks (ties share their mean rank; a case without a value sits at the
-mean rank), standardized: rows are in time order, so ranking ties by position would plant a time trend.
-A text field gives one 0/1 factor per value held by 2% to 98% of the cases, when it has at most 12
-values; lists and rules without an `expr` are listed as not surveyed. In every period (`--by`, half a
-year by default) a one-factor logistic slope b_t and its Fisher standard error s_t, on every row of the
-split at weight 1 (the factors are free, so nothing is down-sampled); a period needs 5 cases of each
-class. DerSimonian-Laird across the periods: Q, σ̂² = max(0, (Q − (k − 1)) / (Σw − Σw²/Σw)) with
-w = 1/s², μ weighted by 1/(s² + σ̂²) and its SE. μ² is biased up by SE(μ)², so the survey uses
-μ₂ = max(0, μ² − SE(μ)²): info% = 100 κ μ₂ / H(Z) (in nats), share = μ₂/(μ₂ + σ̂²), nats/yr = a year of
-cases times κμ₂. σ̂ is biased up near 0; the floor of σ is where Q is expected to reach the spread test,
-and a smaller σ cannot be told from none with these periods. With K > 2 classes, each class is surveyed
-against the reference class on the cases of the two.
+## テスト
 
-**What can be learned.** Fitting one slope on N cases costs about 1/(2N) nats per forecast case, so a
-window keeps 1 − 1/(2NI) of I: half when it gathers N·I = 1 nat, 90% at 5 nats. A random-walk slope
-that drifts its own size in τ periods, with n cases a period, can be tracked to about 1 − 1/√(2nτI).
-The survey measures re-learning directly (`pq`, prequential as in Dawid 1984): every month is forecast
-by a + bF fitted on the 6, 12 or 24 months before it, or on all of them, against the base rate
-re-learned on the same window, in % of H(Z) of the forecast cases. `--gap` is the months before an
-outcome is known. Every window forecasts the same months (those with the longest fixed window plus the
-gap before them, both classes in every window), so the columns compare; a fixed window is kept only
-when it is at most half the span. The standard error comes from the spread of the monthly gains (losses
-cluster in time) and `*` marks a cell above 2 of them. A factor without information is expected at
-−100 Σ n_m/(2N_m) / (n H(Z)); in the planted checks the 24-month and all-month windows land there and
-the short windows a little below (0.02 to 0.09 points on 6 months).
+`python -m unittest` (ネットワークも鍵も使わない。約 35 秒)。
 
-**Reading.** The mean counts when |μ| ≥ 2 SE(μ); the spread counts when Q as a standard normal
-(Wilson-Hilferty) is at least 2. Mean and no spread: `stable`; both: `partly`; spread only: `moving`;
-neither: `none`; fewer than 4 periods: `few`. A factor without information reads as something about
-6.7% of the time, and the summary prints that count next to the readings; nothing is corrected for
-multiplicity, and a rule found by searching the same rows has an inflated μ. `stable` says the slope did
-not move by more than the floor inside the surveyed periods, and nothing about later ones. The survey
-gives no verdict on a study; the [plab-survey](.claude/skills/plab-survey/SKILL.md) skill decides.
+## ライセンス
 
-**Checked.** Planted slopes, 95 cases a month at a 5% rate, 40 seeds over 20 half-years: a slope fixed
-at 0.3 reads `stable` 40 times; mean 0.3 with spread 0.3, `partly` 37; spread 0.4 around 0, `moving`
-34; no information, `none` 37 and no starred cell of 160. Over 8 half-years (a four-year training
-split) the floor of σ is 0.23, so a spread of 0.3 reads `stable` 15 times out of 40. In the synthetic
-walkthrough, rule (b), which flips in 2022, reads `stable` on the training split and `moving` on every
-split after the test (σ̂ 0.20, share 0.11). On the FX case study's rows (2022-01 to 2026-10, 5,170
-cases, 242 losses), 6 of 47 factors read as something against 3.2 by chance, the largest fixed-slope
-information is 0.24% of H(Z), or 0.5 nats a year, and no re-learning cell is starred.
+MIT。[LICENSE](LICENSE) を見てください。
 
-## What the harness enforces, and what it cannot
+## 参考文献
 
-Enforced: the time split; that checks, selection and the test need a frozen, unchanged pre-registration;
-the per-agent caps; the log of every look; that selection follows the rule; that the test runs once and
-only for a selection; the budget; that an `expr` reads only what the decider sees.
-
-Not enforceable by software: that nobody opens `rows.jsonl` or `.plab/data/eval.jsonl` directly. The brief
-tells searching agents not to, and the logs make looks through the tool countable. Treat the eval and test
-files like a sealed envelope.
-
-## Tests
-
-`python -m unittest` (no network, no key; about 35 seconds).
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+- D. Barber and F. Agakov. The IM Algorithm: A Variational Approach to Information Maximization. NIPS 2003.
+- Y. Xu, S. Zhao, J. Song, R. Stewart, and S. Ermon. A Theory of Usable Information under Computational Constraints. ICLR 2020.
+- T. M. Cover and J. A. Thomas. Elements of Information Theory, 2nd ed. Wiley, 2006.

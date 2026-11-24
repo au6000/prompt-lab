@@ -120,7 +120,7 @@ the outcome rates of skipped and taken cases and the value. `check` prints the s
 next to the training share, so a rule that suddenly fires on many more (or fewer) cases is visible.
 Before any search, `survey` measures for each state field, or each rule the machine can answer, how its
 slope moves across the periods of the training split and what re-learning it every month would gain
-(README.ja.md, section 7); on the FX rows the largest relation that one fixed slope could use gathered
+(README.md, section 7); on the FX rows the largest relation that one fixed slope could use gathered
 0.5 nats a year, too little to learn quickly, as the case study found.
 
 ## What remains a matter of discipline

@@ -1,7 +1,7 @@
 """Yardsticks: arrays and labels go in, numbers come out. Pure numpy; nothing here reads a file,
 a prompt or a decision model.
 
-Vocabulary (the theory at the top of README.ja.md):
+Vocabulary (the theory at the top of README.md):
   Z   the outcome, K >= 2 classes. Class 0 is the reference class. With K == 2, class 1 is the
       positive class.
   w   unit weights (1 everywhere except in a down-sampled training split).

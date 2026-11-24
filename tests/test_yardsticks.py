@@ -2,7 +2,7 @@
 
 A two-class outcome with one question must give the numbers of 0.1.0 float for float. The oracle is
 tests/golden/v01_metrics.py, run in this process. Three-class cases are held to values worked out
-from the theory in README.ja.md, never to a run of the code under test.
+from the theory in README.md, never to a run of the code under test.
 """
 import math
 import unittest
@@ -218,7 +218,7 @@ def constant_forecast_gain(labels, k, reps):
 
 
 class ThreeClasses(unittest.TestCase):
-    """The behaviour the theory in README.ja.md predicts for an outcome with more than two classes."""
+    """The behaviour the theory in README.md predicts for an outcome with more than two classes."""
 
     @classmethod
     def setUpClass(cls):
@@ -286,7 +286,7 @@ class ThreeClasses(unittest.TestCase):
 
 
 class AsIsGain(unittest.TestCase):
-    """The worked examples of the theory in README.ja.md: statements true half the time, so H(Z) is one bit."""
+    """The worked examples of the theory in README.md: statements true half the time, so H(Z) is one bit."""
 
     def bits(self, said_true):
         return Y.gain_pct(np.array(said_true)[:, None], plain_labels([1, 1, 0, 0])) / 100
@@ -300,7 +300,7 @@ class AsIsGain(unittest.TestCase):
 
 
 class Sign(unittest.TestCase):
-    """the theory in README.ja.md section 3: the recalibrated gain does not see which way an answer points; the
+    """the theory in README.md section 3: the recalibrated gain does not see which way an answer points; the
     AUC and the as-is gain do."""
 
     def test_reversing_the_answer(self):

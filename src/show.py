@@ -212,7 +212,7 @@ def _drift_by_option(found: Mapping[str, Any], say: Say) -> None:
 
 
 SURVEY_LEGEND = (
-    "per period: logit P(class | F) = a + b x, x the factor's midrank standardized over the units (README.ja.md section 7)",
+    "per period: logit P(class | F) = a + b x, x the factor's midrank standardized over the units (README.md section 7)",
     "  mu, se   the mean slope across the periods and its standard error (the periods are the replication)",
     "  sigma    the spread of the true slope between periods, sampling noise taken out; below the floor it cannot be told from 0",
     "  share    mu2 / (mu2 + sigma^2), mu2 = mu^2 - se^2: the part of the information that one fixed slope can use",
