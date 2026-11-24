@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "promptlab"
+version = "0.2.0"
+description = "Measure how many bits about a known outcome a prompt lets a decision model recover, without overfitting: time splits, a measured zero point, a capped and logged evaluation set, and a one-shot test."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "The prompt-lab authors"}]
+dependencies = ["numpy"]
+
+[project.scripts]
+plab = "promptlab.cli:main"
+
+# パッケージ promptlab のモジュールは src/ に直接置く (prompt-lab/promptlab/ と名前を二重にしない)。
+# src/ の .py だけを配る。tests/、docs/、examples/、scripts/ は配らない。
+# llm_kit/ は別のリポジトリ (自分の pyproject.toml を持つ) なので、ここには含めない。
+# 入れるときは pip install -e "./llm_kit[openai,google]"。
+[tool.setuptools]
+package-dir = {"promptlab" = "src"}
+packages = ["promptlab"]

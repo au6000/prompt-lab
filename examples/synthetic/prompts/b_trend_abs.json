@@ -1,0 +1,7 @@
+{
+ "name": "b: strong trend (absolute level)",
+ "fields": ["event", "side", "move_24h_toward"],
+ "veto_rules": [
+  {"text": "(b) Skip when move_24h_toward is greater than 12.", "expr": "move_24h_toward > 12"}
+ ]
+}

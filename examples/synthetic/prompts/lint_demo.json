@@ -1,0 +1,12 @@
+{
+ "name": "lint demo: wordings that lower agreement",
+ "fields": ["time_utc", "vol_24h", "band_width", "move_5min_toward", "move_24h_toward", "alerts_last_3h", "spread", "last_12_moves"],
+ "veto_rules": [
+  {"text": "(a) Skip when move_5min_toward is greater than 0.4 times band_width.", "expr": "move_5min_toward > 0.4 * band_width"},
+  {"text": "(b) Skip when the maximum of last_12_moves is greater than 5.", "expr": "max(last_12_moves) > 5"},
+  {"text": "(c) Skip when alerts_last_3h is 0 and spread is above 0.3.", "expr": "alerts_last_3h == 0 and spread > 0.3"},
+  {"text": "(d) Skip when vol_24h is below 15 and band_width is below 8.", "expr": "vol_24h < 15 and band_width < 8"},
+  {"text": "(e) Skip when time_utc is after 20:00 and spread is 0.6.", "expr": "time_utc > '20:00' and spread == 0.6"},
+  {"text": "(f) Skip when move_24h_toward is above 10 and alerts_last_3h is above 2.", "expr": "move_24h_toward > 10 and alerts_last_3h > 2"}
+ ]
+}

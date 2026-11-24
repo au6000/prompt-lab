@@ -1,0 +1,7 @@
+{
+ "name": "words only: quiet market",
+ "fields": ["event", "side", "time_utc", "vol_24h", "band_width"],
+ "veto_rules": [
+  "(q) Skip when the market looks unusually quiet: the 24-hour volatility and the band width are both small for this kind of alert."
+ ]
+}

@@ -1,0 +1,7 @@
+{
+ "name": "a: afternoon window",
+ "fields": ["event", "side", "time_utc"],
+ "veto_rules": [
+  {"text": "(a) Skip when time_utc is between 13:00 and 15:59 inclusive.", "expr": "'13:00' <= time_utc <= '15:59'"}
+ ]
+}

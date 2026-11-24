@@ -1,0 +1,8 @@
+{
+ "name": "a+b: window or strong trend",
+ "fields": ["event", "side", "time_utc", "move_24h_toward"],
+ "veto_rules": [
+  {"text": "(a) Skip when time_utc is between 13:00 and 15:59 inclusive.", "expr": "'13:00' <= time_utc <= '15:59'"},
+  {"text": "(b) Skip when move_24h_toward is greater than 12.", "expr": "move_24h_toward > 12"}
+ ]
+}

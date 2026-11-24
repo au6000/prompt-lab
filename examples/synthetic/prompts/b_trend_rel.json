@@ -1,0 +1,7 @@
+{
+ "name": "b: strong trend (relative to volatility)",
+ "fields": ["event", "side", "move_24h_toward", "vol_24h"],
+ "veto_rules": [
+  {"text": "(b) Skip when move_24h_toward is greater than 0.6 times vol_24h.", "expr": "move_24h_toward > 0.6 * vol_24h"}
+ ]
+}

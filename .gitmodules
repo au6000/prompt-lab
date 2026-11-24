@@ -1,0 +1,3 @@
+[submodule "llm_kit"]
+	path = llm_kit
+	url = https://github.com/au6000/llm_kit.git

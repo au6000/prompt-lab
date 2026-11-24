@@ -1,0 +1,16 @@
+[
+ {"old": "^(runs|checks|nominations|agree|ledger)\\.jsonl\\|([^|]*)\\|", "new": "agents/\\2/\\1.jsonl|\\2|",
+  "why": "logs are kept per agent, so that two agents never append to one file"},
+ {"old": "^null_(train|eval)\\.json\\|", "new": "nulls/\\1.p2-pos1.json|",
+  "why": "a zero point belongs to an answer shape; p2-pos1 is one predicate whose yes forecasts the positive class"},
+ {"old": "\\|veto#", "new": "|#",
+  "why": "prompts have no forms, so a record no longer carries one"},
+ {"old": "\\.continuous\\.", "new": ".soft.",
+  "why": "the random answers of a choice or a score are not numbers on a line; they spread their probability"},
+ {"old": "\\.binary\\.", "new": ".sharp.",
+  "why": "the random answers of a choice or a score are not 0 or 1; each sits on one option"},
+ {"old": "sample\\.neg_per_pos$", "new": "sample.reference_per_other",
+  "why": "with more than two classes there is no one negative and one positive class; the reference class is the one thinned"},
+ {"old": "\\bpositives$", "new": "class_counts.1",
+  "why": "with more than two classes there is no one positive class; every class is counted"}
+]

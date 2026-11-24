@@ -1,0 +1,35 @@
+# written by the harness in every task folder
+.plab/
+
+# environments and build output
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# keys and secrets (never commit them; pass keys through environment variables)
+.env
+.env.*
+!.env.example
+*.key
+*_key
+*_key.txt
+*_token
+# Google service-account key files (llm_kit reads them through GOOGLE_APPLICATION_CREDENTIALS)
+*credentials*.json
+gen-lang-client-*.json
+
+# generated example data
+examples/synthetic/rows.jsonl
+
+# Claude Code's per-user settings (the skills under .claude/skills/ are tracked)
+.claude/settings.local.json
+
+# local session notes, and run records of the writing checker (they hold full text copies)
+HANDOFF.md
+.yomiyasu/
+docs/handoff_archive_*.md
+.audit/
